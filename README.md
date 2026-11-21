@@ -19,6 +19,7 @@ barge-in interruption, and locally persisted conversation history.
 - [Project structure](#project-structure)
 
 ## Architecture
+![Uploading Bazai Agent Paradise Architecture (1).png…]()
 
 ```text
 Browser (static/index.html)
