@@ -58,6 +58,11 @@
         margin: 0 0 10px; color: #78859e; font-size: 10px;
         font-weight: 750; letter-spacing: .13em; text-transform: uppercase;
       }
+      .key-panel { display: grid; gap: 8px; }
+      .key-panel label { color: #a7b3ca; font-size: 11px; }
+      .key-panel .conversation-field { margin-top: 4px; }
+      .key-note { margin: 0; color: #7d8aa4; font-size: 10px; line-height: 1.5; }
+      .key-actions { display: grid; gap: 6px; }
       .conversation-field, .composer-input {
         width: 100%; min-width: 0; padding: 11px 12px;
         border: 1px solid #2a3449; border-radius: 10px;
@@ -200,6 +205,28 @@
             <div class="brand-caption">VOICE STUDIO</div>
           </div>
         </div>
+        <form id="api-key-form" class="key-panel">
+          <h2 class="side-heading">API keys</h2>
+          <label for="assemblyai-key">
+            AssemblyAI API key
+            <input id="assemblyai-key" class="conversation-field" type="password"
+                   autocomplete="new-password" maxlength="4096" required>
+          </label>
+          <label for="openai-key">
+            OpenAI API key
+            <input id="openai-key" class="conversation-field" type="password"
+                   autocomplete="new-password" maxlength="4096" required>
+          </label>
+          <p id="key-note" class="key-note">
+            Keys are remembered in browser storage. Avoid shared devices.
+          </p>
+          <div class="key-actions">
+            <button id="connect-keys" type="submit" disabled>Connect with keys</button>
+            <button id="forget-keys" class="secondary" type="button" disabled>
+              Forget saved keys
+            </button>
+          </div>
+        </form>
         <section aria-label="Conversation controls">
           <div>
             <h2 class="side-heading">Conversation</h2>
@@ -261,9 +288,25 @@
       const selectButton = document.querySelector("#select");
       const interruptButton = document.querySelector("#interrupt");
       const stopButton = document.querySelector("#stop");
+      const apiKeyForm = document.querySelector("#api-key-form");
+      const assemblyKeyInput = document.querySelector("#assemblyai-key");
+      const openaiKeyInput = document.querySelector("#openai-key");
+      const connectKeysButton = document.querySelector("#connect-keys");
+      const forgetKeysButton = document.querySelector("#forget-keys");
+      const keyNote = document.querySelector("#key-note");
+      const assemblyKeyStorageKey = "assemblyai-stt-voice.assemblyai-key";
+      const openaiKeyStorageKey = "assemblyai-stt-voice.openai-key";
       const websocketScheme = location.protocol === "https:" ? "wss:" : "ws:";
       const socket = new WebSocket(`${websocketScheme}//${location.host}/ws`);
       socket.binaryType = "arraybuffer";
+
+      try {
+        assemblyKeyInput.value = localStorage.getItem(assemblyKeyStorageKey) || "";
+        openaiKeyInput.value = localStorage.getItem(openaiKeyStorageKey) || "";
+        forgetKeysButton.disabled = !assemblyKeyInput.value && !openaiKeyInput.value;
+      } catch {
+        keyNote.textContent = "Browser storage is unavailable; keys cannot be remembered.";
+      }
 
       const assistantBubbles = new Map();
       const partialBubbles = new Map();
@@ -277,6 +320,7 @@
       let busy = false;
       let conversationActive = false;
       let startRequested = false;
+      let credentialsValidated = false;
       let latestState = "listening";
 
       function setStatus(text) {
@@ -395,6 +439,56 @@
         return true;
       }
 
+      apiKeyForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const assemblyAiApiKey = assemblyKeyInput.value;
+        const openAiApiKey = openaiKeyInput.value;
+        if (!assemblyAiApiKey.trim() || !openAiApiKey.trim()) {
+          keyNote.textContent = "Enter both API keys to connect.";
+          return;
+        }
+        if (socket.readyState !== WebSocket.OPEN) {
+          setStatus("Waiting for the server connection.");
+          return;
+        }
+
+        try {
+          localStorage.setItem(assemblyKeyStorageKey, assemblyAiApiKey);
+          localStorage.setItem(openaiKeyStorageKey, openAiApiKey);
+        } catch {
+          keyNote.textContent = "Could not save keys in this browser. Check storage settings.";
+          return;
+        }
+
+        if (sendJson({
+          type: "configure",
+          assemblyAiApiKey,
+          openAiApiKey,
+        })) {
+          assemblyKeyInput.value = "";
+          openaiKeyInput.value = "";
+          connectKeysButton.disabled = true;
+          forgetKeysButton.disabled = false;
+          keyNote.textContent = "Connecting. Keys are saved only in this browser.";
+          setStatus("Connecting with API keys…");
+        }
+      });
+
+      forgetKeysButton.addEventListener("click", () => {
+        try {
+          localStorage.removeItem(assemblyKeyStorageKey);
+          localStorage.removeItem(openaiKeyStorageKey);
+        } catch {
+          keyNote.textContent = "Could not remove saved keys from browser storage.";
+          return;
+        }
+        assemblyKeyInput.value = "";
+        openaiKeyInput.value = "";
+        forgetKeysButton.disabled = true;
+        socket.close(1000, "Saved credentials cleared");
+        setStatus("Saved keys removed. Refresh this page to reconnect.");
+      });
+
       async function startConversation(selectExisting = false) {
         if (socket.readyState !== WebSocket.OPEN) return;
         stopMicrophone();
@@ -421,9 +515,8 @@
       }
 
       socket.addEventListener("open", () => {
-        setStatus("Connected. Start or select a conversation.");
-        startButton.disabled = false;
-        selectButton.disabled = false;
+        setStatus("Enter both API keys, then connect.");
+        connectKeysButton.disabled = false;
       });
       socket.addEventListener("close", () => {
         stopMicrophone();
@@ -444,7 +537,16 @@
           return;
         }
         const message = JSON.parse(event.data);
-        if (message.type === "state") {
+        if (message.type === "ready") {
+          credentialsValidated = true;
+          setStatus("Connected. Start or select a conversation.");
+          startButton.disabled = false;
+          selectButton.disabled = false;
+          connectKeysButton.disabled = true;
+          assemblyKeyInput.disabled = true;
+          openaiKeyInput.disabled = true;
+          keyNote.textContent = "Connected. Keys remain in browser storage.";
+        } else if (message.type === "state") {
           latestState = message.state;
           if (message.state === "listening") {
             conversationActive = true;
@@ -513,6 +615,12 @@
           summaryNode.style.display = "block";
           summaryNode.textContent = `Conversation summary v${message.version}: ${message.text}`;
         } else if (message.type === "error") {
+          if (!credentialsValidated) {
+            connectKeysButton.disabled = false;
+            assemblyKeyInput.disabled = false;
+            openaiKeyInput.disabled = false;
+            keyNote.textContent = message.message;
+          }
           if (startRequested) {
             startRequested = false;
             startButton.disabled = false;

@@ -4,14 +4,18 @@ import logging
 import os
 import re
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import assemblyai as aai
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
-from openai import AsyncOpenAI
+from openai import (
+    AsyncOpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from assemblyai.streaming.v3 import (
     RealTimeError,
@@ -22,7 +26,6 @@ from assemblyai.streaming.v3 import (
     TurnEvent,
 )
 from conversation_store import ConversationStore
-from infisical_secrets import get_assemblyai_api_key
 
 logger = logging.getLogger(__name__)
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -33,6 +36,7 @@ MIC_SAMPLE_RATE = 16_000
 TTS_SAMPLE_RATE = 24_000
 MIC_FRAME_BYTES = 1_600
 MAX_MESSAGE_CHARS = 4_000
+MAX_API_KEY_CHARS = 4_096
 MAX_SPEECH_CHARS = 240
 SENTENCE_PATTERN = re.compile(
     r".+?[.!?](?:[\"')\]]+)?(?:\s+|$)",
@@ -48,29 +52,90 @@ SYSTEM_MESSAGE = {
     ),
 }
 
-_openai_client: AsyncOpenAI | None = None
+app = FastAPI(title="AssemblyAI Voice Agent")
 
 
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
+def get_openai_client(api_key: str) -> AsyncOpenAI:
+    return AsyncOpenAI(api_key=api_key)
+
+
+class CredentialValidationError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+async def validate_openai_api_key(client: AsyncOpenAI) -> None:
     try:
-        yield
+        models = await client.models.list()
+    except AuthenticationError as error:
+        raise CredentialValidationError(
+            "openai_invalid_key",
+            "OpenAI rejected this key. Check that it is active and copied correctly.",
+        ) from error
+    except PermissionDeniedError as error:
+        raise CredentialValidationError(
+            "openai_access_denied",
+            "This OpenAI key is not permitted to list models.",
+        ) from error
+    except RateLimitError as error:
+        raise CredentialValidationError(
+            "openai_rate_limited",
+            "OpenAI rate-limited key validation. Check account limits and retry.",
+        ) from error
+    except Exception as error:
+        raise CredentialValidationError(
+            "openai_validation_failed",
+            "Could not verify the OpenAI key. Check network access and retry.",
+        ) from error
+
+    if not any(model.id == MODEL for model in models.data):
+        raise CredentialValidationError(
+            "openai_model_unavailable",
+            f"The configured OpenAI model {MODEL!r} is not available to this key.",
+        )
+
+
+def validate_assemblyai_api_key(api_key: str) -> None:
+    client = None
+    try:
+        client = aai.Client(api_key=api_key)
+        response = client.http_client.get(
+            "/v2/transcript",
+            params={"limit": 1},
+            timeout=5,
+        )
+        if response.status_code == 401:
+            raise CredentialValidationError(
+                "assemblyai_invalid_key",
+                "AssemblyAI rejected this key. Check that it is active and copied correctly.",
+            )
+        if response.status_code == 403:
+            raise CredentialValidationError(
+                "assemblyai_access_denied",
+                "This AssemblyAI key does not have permission to list transcripts.",
+            )
+        if response.status_code == 429:
+            raise CredentialValidationError(
+                "assemblyai_rate_limited",
+                "AssemblyAI rate-limited key validation. Wait a moment and retry.",
+            )
+        if not 200 <= response.status_code < 300:
+            raise CredentialValidationError(
+                "assemblyai_validation_failed",
+                "Could not verify the AssemblyAI key. Check its permissions and retry.",
+            )
+    except CredentialValidationError:
+        raise
+    except Exception as error:
+        raise CredentialValidationError(
+            "assemblyai_validation_failed",
+            "Could not reach AssemblyAI to verify the key. Check network access and retry.",
+        ) from error
     finally:
-        if _openai_client is not None:
-            await _openai_client.close()
-
-
-app = FastAPI(title="AssemblyAI Voice Agent", lifespan=lifespan)
-
-
-def get_openai_client() -> AsyncOpenAI:
-    global _openai_client
-    if _openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured.")
-        _openai_client = AsyncOpenAI(api_key=api_key)
-    return _openai_client
+        if client is not None:
+            client.close()
 
 
 def split_speech_chunks(
@@ -253,8 +318,8 @@ class MicrophoneSTT:
         else:
             self._dispatch(self.on_partial, text)
 
-    def _error(self, _client: RealTimeTranscriber, error: RealTimeError) -> None:
-        self._dispatch(self.on_error, str(error))
+    def _error(self, _client: RealTimeTranscriber, _error: RealTimeError) -> None:
+        self._dispatch(self.on_error, "Realtime transcription failed.")
 
 
 async def stream_turn(
@@ -358,39 +423,77 @@ async def health() -> dict[str, str]:
 @app.websocket("/ws")
 async def voice_socket(websocket: WebSocket) -> None:
     await websocket.accept()
-    try:
-        aai_api_key = await asyncio.to_thread(get_assemblyai_api_key)
-    except RuntimeError as error:
-        logger.error("%s", error)
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "assemblyai_key_unavailable",
-                "message": str(error),
-            }
-        )
-        await websocket.close(code=1011)
-        return
+    client: AsyncOpenAI | None = None
+    while client is None:
+        try:
+            packet = await websocket.receive()
+        except WebSocketDisconnect:
+            return
 
-    if not aai_api_key:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "missing_assemblyai_key",
-                "message": "ASSEMBLYAI_API_KEY is not configured.",
-            }
-        )
-        await websocket.close(code=1011)
-        return
+        if packet["type"] == "websocket.disconnect":
+            return
+        raw_credentials = packet.get("text")
+        try:
+            credentials = json.loads(raw_credentials or "")
+        except json.JSONDecodeError:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "credentials_required",
+                    "message": "Submit both API keys to connect.",
+                }
+            )
+            continue
 
-    try:
-        client = get_openai_client()
-    except RuntimeError as error:
-        await websocket.send_json(
-            {"type": "error", "code": "missing_openai_key", "message": str(error)}
-        )
-        await websocket.close(code=1011)
-        return
+        if (
+            not isinstance(credentials, dict)
+            or credentials.get("type") != "configure"
+        ):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "credentials_required",
+                    "message": "Submit both API keys to connect.",
+                }
+            )
+            continue
+
+        aai_api_key = credentials.get("assemblyAiApiKey")
+        openai_api_key = credentials.get("openAiApiKey")
+        if (
+            not isinstance(aai_api_key, str)
+            or not aai_api_key.strip()
+            or len(aai_api_key) > MAX_API_KEY_CHARS
+            or not isinstance(openai_api_key, str)
+            or not openai_api_key.strip()
+            or len(openai_api_key) > MAX_API_KEY_CHARS
+        ):
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "invalid_credentials",
+                    "message": "Enter valid AssemblyAI and OpenAI API keys.",
+                }
+            )
+            continue
+
+        candidate_client = get_openai_client(openai_api_key)
+        try:
+            await validate_openai_api_key(candidate_client)
+            await asyncio.to_thread(validate_assemblyai_api_key, aai_api_key)
+        except CredentialValidationError as error:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": error.code,
+                    "message": error.message,
+                }
+            )
+            await candidate_client.close()
+            continue
+        client = candidate_client
+
+    await websocket.send_json({"type": "ready"})
 
     send_lock = asyncio.Lock()
 
@@ -513,8 +616,11 @@ async def voice_socket(websocket: WebSocket) -> None:
         )
         try:
             await microphone.connect()
-        except Exception:
-            logger.exception("Unable to start realtime transcription")
+        except Exception as error:
+            logger.error(
+                "Unable to start realtime transcription (%s)",
+                type(error).__name__,
+            )
             await close_microphone()
             conversation_id = None
             await send_error("stt_connect_failed", "Unable to start transcription.")
@@ -599,24 +705,56 @@ async def voice_socket(websocket: WebSocket) -> None:
                         aai_api_key,
                         send_json,
                     )
-                except Exception:
-                    logger.exception("Conversation summary update failed")
+                except Exception as error:
+                    logger.error(
+                        "Conversation summary update failed (%s)",
+                        type(error).__name__,
+                    )
                     await send_error(
                         "summary_failed",
                         "Conversation summary could not be updated.",
                     )
-            except aai.TTSError as error:
-                logger.exception("TTS turn failed")
+            except AuthenticationError:
                 await send_error(
-                    "tts_error",
-                    f"TTS failed: {error}",
+                    "openai_invalid_key",
+                    "OpenAI rejected this key during response generation. "
+                    "Forget the saved keys and reconnect.",
                 )
                 if selected_id == conversation_id and microphone is not None:
                     await send_json(
                         {"type": "state", "state": "listening"}
                     )
-            except Exception:
-                logger.exception("Voice turn failed")
+            except PermissionDeniedError:
+                await send_error(
+                    "openai_access_denied",
+                    "This OpenAI key cannot access the configured model.",
+                )
+                if selected_id == conversation_id and microphone is not None:
+                    await send_json(
+                        {"type": "state", "state": "listening"}
+                    )
+            except RateLimitError:
+                await send_error(
+                    "openai_rate_limited",
+                    "OpenAI rate limit or usage quota reached. Check the "
+                    "account's limits and billing, then retry.",
+                )
+                if selected_id == conversation_id and microphone is not None:
+                    await send_json(
+                        {"type": "state", "state": "listening"}
+                    )
+            except aai.TTSError as error:
+                logger.error("TTS turn failed (%s)", type(error).__name__)
+                await send_error(
+                    "tts_error",
+                    "Text-to-speech failed.",
+                )
+                if selected_id == conversation_id and microphone is not None:
+                    await send_json(
+                        {"type": "state", "state": "listening"}
+                    )
+            except Exception as error:
+                logger.error("Voice turn failed (%s)", type(error).__name__)
                 await send_error(
                     "voice_turn_failed",
                     "Voice response failed. Check server logs.",
@@ -656,8 +794,11 @@ async def voice_socket(websocket: WebSocket) -> None:
                     else:
                         try:
                             await microphone.stream(audio)
-                        except Exception:
-                            logger.exception("Unable to stream microphone audio")
+                        except Exception as error:
+                            logger.error(
+                                "Unable to stream microphone audio (%s)",
+                                type(error).__name__,
+                            )
                             await send_error(
                                 "stt_stream_failed",
                                 "Unable to process microphone audio.",
@@ -735,8 +876,14 @@ async def voice_socket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         logger.info("Voice UI disconnected")
     except aai.TTSError as error:
-        logger.exception("Unable to open AssemblyAI TTS session")
-        await send_error("tts_session_failed", str(error))
+        logger.error(
+            "Unable to open AssemblyAI TTS session (%s)",
+            type(error).__name__,
+        )
+        await send_error(
+            "tts_session_failed",
+            "Unable to open AssemblyAI TTS session.",
+        )
     finally:
         await cancel_active()
         await close_microphone()
@@ -745,3 +892,4 @@ async def voice_socket(websocket: WebSocket) -> None:
             await worker_task
         tts_session = None
         store.close()
+        await client.close()

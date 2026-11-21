@@ -52,6 +52,10 @@ class _FakeOpenAI:
     def __init__(self, events=()):
         self.completions = _FakeCompletions(events)
         self.chat = types.SimpleNamespace(completions=self.completions)
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
 
 
 def _install_sdk_stubs():
@@ -95,6 +99,7 @@ def _install_sdk_stubs():
 
     assemblyai.AsyncTTSSession = _Placeholder
     assemblyai.AsyncLLMGateway = _Placeholder
+    assemblyai.Client = _Placeholder
     assemblyai.TTSSession = _Placeholder
     assemblyai.TextToSpeech = _Placeholder
     assemblyai.TTSConfig = _Placeholder
@@ -116,6 +121,9 @@ def _install_sdk_stubs():
 
     openai = types.ModuleType("openai")
     openai.AsyncOpenAI = _AsyncOpenAI
+    openai.AuthenticationError = type("AuthenticationError", (Exception,), {})
+    openai.PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})
+    openai.RateLimitError = type("RateLimitError", (Exception,), {})
     sounddevice = types.ModuleType("sounddevice")
     sounddevice.RawInputStream = _Placeholder
     sounddevice.RawOutputStream = _Placeholder
@@ -322,7 +330,7 @@ class EvalPipelineTests(unittest.TestCase):
                 self.assertIn(path.stem, MODULES)
 
     def test_assemblyai_key_uses_environment_before_infisical(self):
-        module = MODULES["web_app"]
+        module = MODULES["infisical_secrets"]
         with mock.patch.dict(
             os.environ,
             {"ASSEMBLYAI_API_KEY": "env-key"},
@@ -331,7 +339,7 @@ class EvalPipelineTests(unittest.TestCase):
             self.assertEqual(module.get_assemblyai_api_key(), "env-key")
 
     def test_assemblyai_key_is_loaded_from_infisical(self):
-        module = MODULES["web_app"]
+        module = MODULES["infisical_secrets"]
         calls = []
 
         class FakeClient:
@@ -389,7 +397,7 @@ class EvalPipelineTests(unittest.TestCase):
         )
 
     def test_assemblyai_key_rejects_partial_infisical_configuration(self):
-        module = MODULES["web_app"]
+        module = MODULES["infisical_secrets"]
         with mock.patch.dict(
             os.environ,
             {"INFISICAL_CLIENT_ID": "client-id"},
@@ -397,6 +405,84 @@ class EvalPipelineTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "INFISICAL_CLIENT_SECRET"):
                 module.get_assemblyai_api_key()
+
+    def test_voice_socket_requires_both_ui_api_keys(self):
+        module = MODULES["web_app"]
+        websocket = _FakeConversationWebSocket(
+            module,
+            [
+                {
+                    "type": "configure",
+                    "assemblyAiApiKey": "",
+                    "openAiApiKey": "",
+                }
+            ],
+        )
+        client_factory = mock.patch.object(module, "get_openai_client")
+        with client_factory as create_client:
+            asyncio.run(module.voice_socket(websocket))
+
+        errors = [
+            item[1]
+            for item in websocket.sent
+            if item[0] == "json" and item[1].get("type") == "error"
+        ]
+        self.assertEqual(errors[0]["code"], "invalid_credentials")
+        create_client.assert_not_called()
+
+    def test_openai_key_validation_checks_model_access(self):
+        module = MODULES["web_app"]
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                list=mock.AsyncMock(
+                    return_value=types.SimpleNamespace(
+                        data=[types.SimpleNamespace(id=module.MODEL)]
+                    )
+                )
+            )
+        )
+        asyncio.run(module.validate_openai_api_key(client))
+        client.models.list.assert_awaited_once_with()
+
+        client.models.list = mock.AsyncMock(
+            return_value=types.SimpleNamespace(
+                data=[types.SimpleNamespace(id="some-other-model")]
+            )
+        )
+        with self.assertRaises(module.CredentialValidationError) as raised:
+            asyncio.run(module.validate_openai_api_key(client))
+        self.assertEqual(raised.exception.code, "openai_model_unavailable")
+
+    def test_assemblyai_key_validation_checks_auth_without_transcribing(self):
+        module = MODULES["web_app"]
+        requests = []
+
+        class FakeAPIClient:
+            def __init__(self, *, api_key):
+                requests.append(("client", api_key))
+                self.http_client = types.SimpleNamespace(
+                    get=lambda *args, **kwargs: (
+                        requests.append(("get", args, kwargs))
+                        or types.SimpleNamespace(status_code=200)
+                    )
+                )
+
+            def close(self):
+                requests.append(("close",))
+
+        with mock.patch.object(module.aai, "Client", FakeAPIClient):
+            module.validate_assemblyai_api_key("assemblyai-test-key")
+
+        self.assertEqual(requests[0], ("client", "assemblyai-test-key"))
+        self.assertEqual(requests[-1], ("close",))
+        self.assertIn(
+            (
+                "get",
+                ("/v2/transcript",),
+                {"params": {"limit": 1}, "timeout": 5},
+            ),
+            requests,
+        )
 
     def test_openai_stream_to_tts_produces_sentences_and_audio(self):
         module = MODULES["openai_demo"]
@@ -503,6 +589,7 @@ class EvalPipelineTests(unittest.TestCase):
         session.open_count = 0
         session.close_count = 0
         streamed_audio = []
+        transcriber_keys = []
 
         class PersistentSession(_FakeAsyncTTSSession):
             async def __aenter__(self):
@@ -513,7 +600,8 @@ class EvalPipelineTests(unittest.TestCase):
                 session.close_count += 1
 
         class FakeTranscriber:
-            def __init__(self, **_kwargs):
+            def __init__(self, **kwargs):
+                transcriber_keys.append(kwargs.get("api_key"))
                 self.handlers = {}
 
             def on(self, event, callback):
@@ -532,6 +620,11 @@ class EvalPipelineTests(unittest.TestCase):
         websocket = _FakeConversationWebSocket(
             module,
             [
+                {
+                    "type": "configure",
+                    "assemblyAiApiKey": "eval-assemblyai-key",
+                    "openAiApiKey": "eval-openai-key",
+                },
                 {"type": "start", "conversationId": "eval-conversation"},
                 b"\x00" * 1_600,
                 {"type": "text", "text": "First turn"},
@@ -546,11 +639,21 @@ class EvalPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "websocket.sqlite")
+            openai_client_factory = mock.patch.object(
+                module,
+                "get_openai_client",
+                return_value=client,
+            )
+            openai_validation = mock.patch.object(
+                module,
+                "validate_openai_api_key",
+                new=mock.AsyncMock(),
+            )
+            assemblyai_validation = mock.patch.object(
+                module,
+                "validate_assemblyai_api_key",
+            )
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"ASSEMBLYAI_API_KEY": "eval-key"},
-                ),
                 mock.patch.object(module, "HISTORY_DB", db_path),
                 mock.patch.object(module, "aai", fake_aai),
                 mock.patch.object(
@@ -558,13 +661,14 @@ class EvalPipelineTests(unittest.TestCase):
                     "RealTimeTranscriber",
                     FakeTranscriber,
                 ),
-                mock.patch.object(
-                    module,
-                    "get_openai_client",
-                    return_value=client,
-                ),
+                openai_client_factory as create_client,
+                openai_validation as validate_openai,
+                assemblyai_validation as validate_assemblyai,
             ):
                 asyncio.run(module.voice_socket(websocket))
+            create_client.assert_called_once_with("eval-openai-key")
+            validate_openai.assert_awaited_once_with(client)
+            validate_assemblyai.assert_called_once_with("eval-assemblyai-key")
 
             store_module = MODULES["conversation_store"]
             history = store_module.ConversationStore(db_path)
@@ -575,6 +679,8 @@ class EvalPipelineTests(unittest.TestCase):
 
         self.assertEqual(session.open_count, 1)
         self.assertEqual(session.close_count, 1)
+        self.assertTrue(client.closed)
+        self.assertEqual(transcriber_keys, ["eval-assemblyai-key"])
         self.assertEqual(session.generated, ["Hello.", "Hello."])
         self.assertEqual(streamed_audio, [b"\x00" * 1_600])
         self.assertEqual(
