@@ -11,6 +11,7 @@ import assemblyai as aai
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from openai import (
+    APIError,
     AsyncOpenAI,
     AuthenticationError,
     PermissionDeniedError,
@@ -33,11 +34,16 @@ SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-sonnet-4-6")
 SUMMARY_TRIGGER_MESSAGES = int(os.getenv("SUMMARY_TRIGGER_MESSAGES", "30"))
 RECENT_CONTEXT_MESSAGES = 20
 MIC_SAMPLE_RATE = 16_000
-TTS_SAMPLE_RATE = 24_000
 MIC_FRAME_BYTES = 1_600
 MAX_MESSAGE_CHARS = 4_000
 MAX_API_KEY_CHARS = 4_096
 MAX_SPEECH_CHARS = 240
+TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin")
+TTS_INSTRUCTIONS = (
+    "Speak naturally and clearly, using the language and pronunciation "
+    "appropriate for the text."
+)
 OPENAI_RATE_LIMIT_RETRIES = 2
 MAX_OPENAI_RETRY_DELAY = 5
 SENTENCE_PATTERN = re.compile(
@@ -51,7 +57,8 @@ SYSTEM_MESSAGE = {
     "content": (
         "You are a concise voice assistant. Reply in the same language as the "
         "user's latest message, switching languages whenever the user does. "
-        "Use natural, complete sentences and avoid Markdown."
+        "Use fluent, idiomatic grammar and natural, complete sentences. Avoid "
+        "Markdown unless the user asks for it."
     ),
 }
 
@@ -350,7 +357,6 @@ class MicrophoneSTT:
 
 async def stream_turn(
     websocket: WebSocket,
-    session: aai.AsyncTTSSession,
     client: AsyncOpenAI,
     messages: list[dict[str, str]],
     message_id: str,
@@ -358,7 +364,7 @@ async def stream_turn(
     send_json: Callable[[dict[str, Any]], Awaitable[None]],
     send_bytes: Callable[[bytes], Awaitable[None]],
 ) -> tuple[str, bool]:
-    flush_ids: asyncio.Queue[int | None] = asyncio.Queue()
+    speech_queue: asyncio.Queue[str | None] = asyncio.Queue()
     stream = None
     reply = ""
     pending = ""
@@ -368,18 +374,32 @@ async def stream_turn(
     async def send_audio() -> None:
         nonlocal speaking
         while True:
-            flush_id = await flush_ids.get()
-            if flush_id is None:
+            speech_text = await speech_queue.get()
+            if speech_text is None:
                 return
-            async for chunk in session.audio(flush_id):
-                if stop.is_set():
-                    return
-                if len(chunk) % 2:
+            async with client.audio.speech.with_streaming_response.create(
+                model=TTS_MODEL,
+                voice=TTS_VOICE,
+                input=speech_text,
+                instructions=TTS_INSTRUCTIONS,
+                response_format="pcm",
+            ) as response:
+                pending_audio = b""
+                async for chunk in response.iter_bytes(chunk_size=4_096):
+                    if stop.is_set():
+                        return
+                    audio = pending_audio + chunk
+                    complete_length = len(audio) - (len(audio) % 2)
+                    if complete_length:
+                        if not speaking:
+                            speaking = True
+                            await send_json(
+                                {"type": "state", "state": "speaking"}
+                            )
+                        await send_bytes(audio[:complete_length])
+                    pending_audio = audio[complete_length:]
+                if pending_audio:
                     raise ValueError("TTS returned an incomplete PCM sample.")
-                if not speaking:
-                    speaking = True
-                    await send_json({"type": "state", "state": "speaking"})
-                await send_bytes(chunk)
 
     audio_task = asyncio.create_task(send_audio())
     try:
@@ -422,21 +442,31 @@ async def stream_turn(
                 if stop.is_set():
                     interrupted = True
                     break
-                await session.generate(chunk)
-                await flush_ids.put(await session.flush())
+                if audio_task.done():
+                    await audio_task
+                await speech_queue.put(chunk)
 
         if pending.strip() and not stop.is_set():
-            await session.generate(pending.strip())
-            await flush_ids.put(await session.flush())
+            if audio_task.done():
+                await audio_task
+            await speech_queue.put(pending.strip())
     except asyncio.CancelledError:
         interrupted = True
         stop.set()
-        await session.cancel()
+        audio_task.cancel()
     finally:
         if stream is not None:
             await stream.close()
-        await flush_ids.put(None)
-        await audio_task
+        if not audio_task.done():
+            if stop.is_set():
+                audio_task.cancel()
+            else:
+                await speech_queue.put(None)
+        try:
+            await audio_task
+        except asyncio.CancelledError:
+            if not stop.is_set():
+                raise
 
     return reply.strip(), interrupted or stop.is_set()
 
@@ -608,16 +638,10 @@ async def voice_socket(websocket: WebSocket) -> None:
     store = ConversationStore(HISTORY_DB)
     loop = asyncio.get_running_loop()
     turn_queue: asyncio.Queue[tuple[str, int, str] | None] = asyncio.Queue()
-    tts_config = aai.TTSConfig(
-        voice_id=os.getenv("TTS_VOICE_ID", "aai-kyla"),
-        language="english",
-        sample_rate=TTS_SAMPLE_RATE,
-    )
 
     conversation_id: str | None = None
     turn_number = 0
     microphone: MicrophoneSTT | None = None
-    tts_session: aai.AsyncTTSSession | None = None
     active_stop: asyncio.Event | None = None
     active_task: asyncio.Task[tuple[str, bool]] | None = None
     active_turn_done: asyncio.Event | None = None
@@ -744,7 +768,7 @@ async def voice_socket(websocket: WebSocket) -> None:
             if item is None:
                 return
             selected_id, _, _ = item
-            if selected_id != conversation_id or tts_session is None:
+            if selected_id != conversation_id:
                 continue
 
             message_id = str(uuid.uuid4())
@@ -763,7 +787,6 @@ async def voice_socket(websocket: WebSocket) -> None:
             task = asyncio.create_task(
                 stream_turn(
                     websocket,
-                    tts_session,
                     client,
                     messages,
                     message_id,
@@ -855,11 +878,15 @@ async def voice_socket(websocket: WebSocket) -> None:
                     await send_json(
                         {"type": "state", "state": "listening"}
                     )
-            except aai.TTSError as error:
-                logger.error("TTS turn failed (%s)", type(error).__name__)
+            except APIError as error:
+                logger.error(
+                    "OpenAI voice response failed (%s)",
+                    type(error).__name__,
+                )
                 await send_error(
-                    "tts_error",
-                    "Text-to-speech failed.",
+                    "openai_voice_failed",
+                    "OpenAI could not generate the voice response. Check "
+                    "audio API access and try again.",
                 )
                 if selected_id == conversation_id and microphone is not None:
                     await send_json(
@@ -883,125 +910,110 @@ async def voice_socket(websocket: WebSocket) -> None:
 
     worker_task: asyncio.Task[None] | None = None
     try:
-        async with aai.AsyncTTSSession(
-            tts_config,
-            api_key=aai_api_key,
-        ) as session:
-            tts_session = session
-            worker_task = asyncio.create_task(process_turns())
-            while True:
-                packet = await websocket.receive()
-                if packet["type"] == "websocket.disconnect":
-                    break
+        worker_task = asyncio.create_task(process_turns())
+        while True:
+            packet = await websocket.receive()
+            if packet["type"] == "websocket.disconnect":
+                break
 
-                audio = packet.get("bytes")
-                if audio is not None:
-                    if microphone is None:
-                        await send_error("not_listening", "Send start before microphone audio.")
-                    elif len(audio) != MIC_FRAME_BYTES:
-                        await send_error(
-                            "invalid_audio_frame",
-                            f"Expected exactly {MIC_FRAME_BYTES} bytes of PCM audio.",
-                        )
-                    else:
-                        try:
-                            await microphone.stream(audio)
-                        except Exception as error:
-                            logger.error(
-                                "Unable to stream microphone audio (%s)",
-                                type(error).__name__,
-                            )
-                            await send_error(
-                                "stt_stream_failed",
-                                "Unable to process microphone audio.",
-                            )
-                    continue
-
-                raw_text = packet.get("text")
-                if raw_text is None:
-                    continue
-                try:
-                    payload = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    await send_error("invalid_json", "WebSocket message must be JSON.")
-                    continue
-                if not isinstance(payload, dict):
-                    await send_error("invalid_message", "Expected a JSON object.")
-                    continue
-
-                message_type = payload.get("type")
-                if message_type == "start":
-                    requested_id = payload.get("conversationId")
-                    selected_id = (
-                        requested_id.strip()
-                        if isinstance(requested_id, str) and requested_id.strip()
-                        else str(uuid.uuid4())
+            audio = packet.get("bytes")
+            if audio is not None:
+                if microphone is None:
+                    await send_error("not_listening", "Send start before microphone audio.")
+                elif len(audio) != MIC_FRAME_BYTES:
+                    await send_error(
+                        "invalid_audio_frame",
+                        f"Expected exactly {MIC_FRAME_BYTES} bytes of PCM audio.",
                     )
-                    await start_conversation(selected_id, create_if_missing=True)
-                elif message_type == "select_conversation":
-                    selected_id = payload.get("conversationId")
-                    if not isinstance(selected_id, str) or not selected_id.strip():
+                else:
+                    try:
+                        await microphone.stream(audio)
+                    except Exception as error:
+                        logger.error(
+                            "Unable to stream microphone audio (%s)",
+                            type(error).__name__,
+                        )
                         await send_error(
-                            "invalid_conversation_id",
-                            "A conversationId is required.",
+                            "stt_stream_failed",
+                            "Unable to process microphone audio.",
                         )
-                    else:
-                        await start_conversation(
-                            selected_id.strip(),
-                            create_if_missing=False,
-                        )
-                elif message_type == "stop":
-                    await cancel_active()
-                    await close_microphone()
-                    conversation_id = None
+                continue
+
+            raw_text = packet.get("text")
+            if raw_text is None:
+                continue
+            try:
+                payload = json.loads(raw_text)
+            except json.JSONDecodeError:
+                await send_error("invalid_json", "WebSocket message must be JSON.")
+                continue
+            if not isinstance(payload, dict):
+                await send_error("invalid_message", "Expected a JSON object.")
+                continue
+
+            message_type = payload.get("type")
+            if message_type == "start":
+                requested_id = payload.get("conversationId")
+                selected_id = (
+                    requested_id.strip()
+                    if isinstance(requested_id, str) and requested_id.strip()
+                    else str(uuid.uuid4())
+                )
+                await start_conversation(selected_id, create_if_missing=True)
+            elif message_type == "select_conversation":
+                selected_id = payload.get("conversationId")
+                if not isinstance(selected_id, str) or not selected_id.strip():
+                    await send_error(
+                        "invalid_conversation_id",
+                        "A conversationId is required.",
+                    )
+                else:
+                    await start_conversation(
+                        selected_id.strip(),
+                        create_if_missing=False,
+                    )
+            elif message_type == "stop":
+                await cancel_active()
+                await close_microphone()
+                conversation_id = None
+                await send_json(
+                    {"type": "state", "state": "interrupted"}
+                )
+            elif message_type == "interrupt":
+                if active_task is not None and not active_task.done():
                     await send_json(
                         {"type": "state", "state": "interrupted"}
                     )
-                elif message_type == "interrupt":
-                    if active_task is not None and not active_task.done():
-                        await send_json(
-                            {"type": "state", "state": "interrupted"}
-                        )
-                        await cancel_active()
-                elif message_type == "text":
-                    text = payload.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        await send_error("empty_text", "Enter a non-empty message.")
-                    elif len(text) > MAX_MESSAGE_CHARS:
-                        await send_error(
-                            "text_too_long",
-                            f"Messages must be at most {MAX_MESSAGE_CHARS} characters.",
-                        )
-                    elif conversation_id is None:
-                        await send_error(
-                            "conversation_not_started",
-                            "Send start or select_conversation first.",
-                        )
-                    else:
-                        await accept_final(text, conversation_id)
-                else:
+                    await cancel_active()
+            elif message_type == "text":
+                text = payload.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    await send_error("empty_text", "Enter a non-empty message.")
+                elif len(text) > MAX_MESSAGE_CHARS:
                     await send_error(
-                        "unknown_message_type",
-                        "Supported types: start, stop, interrupt, text, "
-                        "select_conversation.",
+                        "text_too_long",
+                        f"Messages must be at most {MAX_MESSAGE_CHARS} characters.",
                     )
+                elif conversation_id is None:
+                    await send_error(
+                        "conversation_not_started",
+                        "Send start or select_conversation first.",
+                    )
+                else:
+                    await accept_final(text, conversation_id)
+            else:
+                await send_error(
+                    "unknown_message_type",
+                    "Supported types: start, stop, interrupt, text, "
+                    "select_conversation.",
+                )
     except WebSocketDisconnect:
         logger.info("Voice UI disconnected")
-    except aai.TTSError as error:
-        logger.error(
-            "Unable to open AssemblyAI TTS session (%s)",
-            type(error).__name__,
-        )
-        await send_error(
-            "tts_session_failed",
-            "Unable to open AssemblyAI TTS session.",
-        )
     finally:
         await cancel_active()
         await close_microphone()
         if worker_task is not None:
             await turn_queue.put(None)
             await worker_task
-        tts_session = None
         store.close()
         await client.close()

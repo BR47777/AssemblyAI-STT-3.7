@@ -35,6 +35,38 @@ class _FakeStream:
         return None
 
 
+class _FakeSpeechResponse:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def iter_bytes(self, chunk_size=None):
+        for chunk in self.chunks:
+            yield chunk
+
+
+def _attach_fake_tts(client):
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        audio = bytes((len(calls), 0))
+        return _FakeSpeechResponse([audio[:1], audio[1:]])
+
+    client.audio = types.SimpleNamespace(
+        speech=types.SimpleNamespace(
+            with_streaming_response=types.SimpleNamespace(create=create)
+        )
+    )
+    client.tts_calls = calls
+    return calls
+
+
 class _FakeCompletions:
     def __init__(self, events=()):
         self.events = events
@@ -53,6 +85,7 @@ class _FakeOpenAI:
         self.completions = _FakeCompletions(events)
         self.chat = types.SimpleNamespace(completions=self.completions)
         self.closed = False
+        _attach_fake_tts(self)
 
     async def close(self):
         self.closed = True
@@ -120,6 +153,7 @@ def _install_sdk_stubs():
     assemblyai.streaming = streaming
 
     openai = types.ModuleType("openai")
+    openai.APIError = type("APIError", (Exception,), {})
     openai.AsyncOpenAI = _AsyncOpenAI
     openai.AuthenticationError = type("AuthenticationError", (Exception,), {})
     openai.PermissionDeniedError = type("PermissionDeniedError", (Exception,), {})
@@ -615,7 +649,6 @@ class EvalPipelineTests(unittest.TestCase):
         self.assertLessEqual(len(remainder), 24)
 
         websocket = _FakeWebSocket()
-        session = _FakeAsyncTTSSession()
         client = _FakeOpenAI(
             [_event("First sentence. "), _event("Second sentence.")]
         )
@@ -624,7 +657,6 @@ class EvalPipelineTests(unittest.TestCase):
         reply, interrupted = asyncio.run(
             module.stream_turn(
                 websocket,
-                session,
                 client,
                 messages,
                 "eval-message",
@@ -637,8 +669,17 @@ class EvalPipelineTests(unittest.TestCase):
         self.assertEqual(reply, "First sentence. Second sentence.")
         self.assertFalse(interrupted)
         self.assertEqual(
-            session.generated,
+            [call["input"] for call in client.tts_calls],
             ["First sentence.", "Second sentence."],
+        )
+        self.assertTrue(
+            all(call["response_format"] == "pcm" for call in client.tts_calls)
+        )
+        self.assertTrue(
+            all(
+                call["instructions"] == module.TTS_INSTRUCTIONS
+                for call in client.tts_calls
+            )
         )
         json_events = [
             item[1]["type"]
@@ -654,7 +695,6 @@ class EvalPipelineTests(unittest.TestCase):
 
     def test_interrupt_cancels_active_tts_and_preserves_partial_text(self):
         module = MODULES["web_app"]
-        session = _FakeAsyncTTSSession()
         websocket = _FakeWebSocket()
 
         class Completions:
@@ -664,12 +704,12 @@ class EvalPipelineTests(unittest.TestCase):
         client = types.SimpleNamespace(
             chat=types.SimpleNamespace(completions=Completions())
         )
+        tts_calls = _attach_fake_tts(client)
         stop = asyncio.Event()
 
         async def run_turn():
             return await module.stream_turn(
                 websocket,
-                session,
                 client,
                 [{"role": "user", "content": "test"}],
                 "interrupt-eval",
@@ -688,11 +728,10 @@ class EvalPipelineTests(unittest.TestCase):
 
         self.assertEqual(reply, "Partial reply")
         self.assertTrue(interrupted)
-        self.assertEqual(session.cancel_count, 1)
+        self.assertEqual(tts_calls, [])
 
     def test_stream_turn_retries_transient_openai_rate_limit(self):
         module = MODULES["web_app"]
-        session = _FakeAsyncTTSSession()
         websocket = _FakeWebSocket()
         rate_limit = module.RateLimitError("rate limited")
         rate_limit.body = {"error": {"code": "rate_limit_exceeded"}}
@@ -714,6 +753,7 @@ class EvalPipelineTests(unittest.TestCase):
         client = types.SimpleNamespace(
             chat=types.SimpleNamespace(completions=completions)
         )
+        tts_calls = _attach_fake_tts(client)
 
         async def run_turn():
             with mock.patch.object(
@@ -723,7 +763,6 @@ class EvalPipelineTests(unittest.TestCase):
             ) as sleep:
                 result = await module.stream_turn(
                     websocket,
-                    session,
                     client,
                     [{"role": "user", "content": "test"}],
                     "rate-limit-retry",
@@ -738,10 +777,13 @@ class EvalPipelineTests(unittest.TestCase):
         self.assertEqual(completions.calls, 2)
         self.assertEqual(reply, "Recovered.")
         self.assertFalse(interrupted)
+        self.assertEqual(
+            [call["input"] for call in tts_calls],
+            ["Recovered."],
+        )
 
     def test_stream_turn_does_not_retry_exhausted_openai_quota(self):
         module = MODULES["web_app"]
-        session = _FakeAsyncTTSSession()
         websocket = _FakeWebSocket()
         quota_error = module.RateLimitError("quota exhausted")
         quota_error.body = {"error": {"code": "insufficient_quota"}}
@@ -757,6 +799,7 @@ class EvalPipelineTests(unittest.TestCase):
         client = types.SimpleNamespace(
             chat=types.SimpleNamespace(completions=completions)
         )
+        _attach_fake_tts(client)
 
         async def run_turn():
             with mock.patch.object(
@@ -767,7 +810,6 @@ class EvalPipelineTests(unittest.TestCase):
                 with self.assertRaises(module.RateLimitError):
                     await module.stream_turn(
                         websocket,
-                        session,
                         client,
                         [{"role": "user", "content": "test"}],
                         "quota-error",
@@ -780,21 +822,34 @@ class EvalPipelineTests(unittest.TestCase):
         asyncio.run(run_turn())
         self.assertEqual(completions.calls, 1)
 
-    def test_websocket_keeps_one_tts_session_open_across_turns(self):
+    def test_stream_turn_surfaces_openai_tts_errors(self):
         module = MODULES["web_app"]
-        session = _FakeAsyncTTSSession()
-        session.open_count = 0
-        session.close_count = 0
+        websocket = _FakeWebSocket()
+        client = _FakeOpenAI([_event("Hello.")])
+
+        def fail_tts(**_kwargs):
+            raise module.APIError("speech unavailable")
+
+        client.audio.speech.with_streaming_response.create = fail_tts
+
+        async def run_turn():
+            with self.assertRaises(module.APIError):
+                await module.stream_turn(
+                    websocket,
+                    client,
+                    [{"role": "user", "content": "Say hello."}],
+                    "tts-error",
+                    asyncio.Event(),
+                    websocket.send_json,
+                    websocket.send_bytes,
+                )
+
+        asyncio.run(run_turn())
+
+    def test_websocket_uses_openai_tts_for_each_turn(self):
+        module = MODULES["web_app"]
         streamed_audio = []
         transcriber_keys = []
-
-        class PersistentSession(_FakeAsyncTTSSession):
-            async def __aenter__(self):
-                session.open_count += 1
-                return session
-
-            async def __aexit__(self, *_args):
-                session.close_count += 1
 
         class FakeTranscriber:
             def __init__(self, **kwargs):
@@ -828,11 +883,6 @@ class EvalPipelineTests(unittest.TestCase):
                 {"type": "text", "text": "Second turn"},
             ],
         )
-        fake_aai = types.SimpleNamespace(
-            TTSConfig=lambda **kwargs: kwargs,
-            AsyncTTSSession=lambda *_args, **_kwargs: PersistentSession(),
-            TTSError=module.aai.TTSError,
-        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "websocket.sqlite")
@@ -852,7 +902,6 @@ class EvalPipelineTests(unittest.TestCase):
             )
             with (
                 mock.patch.object(module, "HISTORY_DB", db_path),
-                mock.patch.object(module, "aai", fake_aai),
                 mock.patch.object(
                     module,
                     "RealTimeTranscriber",
@@ -874,11 +923,18 @@ class EvalPipelineTests(unittest.TestCase):
             finally:
                 history.close()
 
-        self.assertEqual(session.open_count, 1)
-        self.assertEqual(session.close_count, 1)
         self.assertTrue(client.closed)
         self.assertEqual(transcriber_keys, ["eval-assemblyai-key"])
-        self.assertEqual(session.generated, ["Hello.", "Hello."])
+        self.assertEqual(
+            [call["input"] for call in client.tts_calls],
+            ["Hello.", "Hello."],
+        )
+        self.assertTrue(
+            all(call["model"] == module.TTS_MODEL for call in client.tts_calls)
+        )
+        self.assertTrue(
+            all(call["voice"] == module.TTS_VOICE for call in client.tts_calls)
+        )
         self.assertEqual(streamed_audio, [b"\x00" * 1_600])
         self.assertEqual(
             client.completions.calls[0]["messages"][-1]["role"], "user"

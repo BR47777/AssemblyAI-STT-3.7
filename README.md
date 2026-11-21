@@ -33,7 +33,7 @@ FastAPI (web_app.py)
   |-- final user text -> conversation queue -> OpenAI streamed response
   |                                          | deltas -> browser chat
   |                                          v
-  |                               sentence chunks -> AssemblyAI TTS
+  |                               sentence chunks -> multilingual OpenAI TTS
   |                                          | PCM audio -> browser playback
   |-- conversation messages and versioned summaries -> SQLite
   `-- threshold-based summaries -> AssemblyAI LLM Gateway
@@ -48,8 +48,9 @@ FastAPI (web_app.py)
    Partial and final transcript events are sent to the browser. Final user
    messages are persisted and queued for response generation.
 3. A worker streams the response from OpenAI. Text deltas are sent to the UI
-   while completed sentence chunks are sent to an AssemblyAI TTS session.
-   Long sentences are split at a 240-character maximum.
+   while completed sentence chunks are synthesized by OpenAI TTS in the
+   language of the response. Long sentences are split at a 240-character
+   maximum.
 4. TTS PCM audio is sent to the browser as binary WebSocket frames. Speaking
    over the agent or sending an interrupt control cancels the active response
    and stops scheduled playback.
@@ -99,8 +100,9 @@ The backend validates the OpenAI key by listing available models and checks
 that the configured model is available. It validates the AssemblyAI key with
 a read-only transcript-list request. These checks do not generate text or
 transcribe audio. On success, the backend creates an OpenAI client scoped to
-that connection and passes the AssemblyAI key to the realtime STT, TTS, and
-LLM Gateway clients. The OpenAI client is closed when the WebSocket ends.
+that connection for response generation and multilingual speech synthesis,
+and passes the AssemblyAI key to realtime STT and LLM Gateway clients. The
+OpenAI client is closed when the WebSocket ends.
 
 Provider validation cannot guarantee later requests will be within quota. If
 OpenAI rate-limits a voice response, the UI reports that account limits or
@@ -165,7 +167,8 @@ Incomplete credentials or a failed lookup raise an error.
 | `OPENAI_MODEL` | App and selected demos | `gpt-4.1-mini` | Model used for response generation. |
 | `SUMMARY_MODEL` | App and summary demos | `claude-sonnet-4-6` | Model used for summary generation. |
 | `SUMMARY_TRIGGER_MESSAGES` | Web app | `30` | Unsummarized message threshold. |
-| `TTS_VOICE_ID` | Web app | `aai-kyla` | AssemblyAI TTS voice. |
+| `OPENAI_TTS_MODEL` | Web app | `gpt-4o-mini-tts` | OpenAI text-to-speech model; supports multilingual speech. |
+| `OPENAI_TTS_VOICE` | Web app | `marin` | OpenAI speech voice. |
 | `HISTORY_DB` | Web app and history demos | `agent_ui_history.db` in app | SQLite database path. |
 | `SUMMARY_TRIGGER_TOKENS` | Token-budget demo | `6000` | Token threshold for `token_budget_voice_history.py`. |
 | `RECENT_CONTEXT_TOKENS` | Token-budget demo | `2500` | Recent token budget for `token_budget_voice_history.py`. |
@@ -175,6 +178,11 @@ Incomplete credentials or a failed lookup raise an error.
 `SUMMARY_TRIGGER_TOKENS`, `RECENT_CONTEXT_TOKENS`, and
 `LLM_GATEWAY_MODEL_REGION` apply to the standalone history demos, not the web
 app's message-count summary setting.
+
+The default `gpt-4o-mini-tts` model is scheduled for retirement on January 6,
+2027. Set `OPENAI_TTS_MODEL` to a supported replacement when migrating.
+OpenAI TTS accepts text in multiple languages, though its voices are optimized
+for English, so pronunciation quality can vary by language.
 
 ## WebSocket protocol
 
