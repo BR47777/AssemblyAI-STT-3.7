@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AssemblyAI Voice Agent</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #edf2ff;
+        background: #0a0e17;
+        font-synthesis: none;
+      }
+      * { box-sizing: border-box; }
+      body {
+        min-width: 320px;
+        min-height: 100vh;
+        margin: 0;
+        padding: 22px;
+        background:
+          radial-gradient(ellipse at 68% 0%, #23305255, transparent 38%),
+          #0a0e17;
+      }
+      button, input { font: inherit; }
+      .shell {
+        width: min(1280px, 100%);
+        height: min(900px, calc(100vh - 44px));
+        min-height: 560px;
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 280px minmax(0, 1fr);
+        overflow: hidden;
+        border: 1px solid #252d40;
+        border-radius: 22px;
+        background: #111722;
+        box-shadow: 0 30px 100px #0008;
+      }
+      .sidebar {
+        display: flex;
+        flex-direction: column;
+        gap: 26px;
+        padding: 25px 18px 18px;
+        border-right: 1px solid #252d40;
+        background: #0e141f;
+      }
+      .brand { display: flex; align-items: center; gap: 11px; }
+      .brand-mark {
+        width: 38px; height: 38px; display: grid; place-items: center;
+        border: 1px solid #6176ff66; border-radius: 12px;
+        background: linear-gradient(145deg, #6479ff, #9259da);
+        color: white; font-size: 17px; font-weight: 800;
+        box-shadow: 0 6px 22px #596fff33;
+      }
+      .brand-name { font-size: 14px; font-weight: 750; letter-spacing: .01em; }
+      .brand-caption { margin-top: 3px; color: #7d8aa4; font-size: 11px; }
+      .side-heading {
+        margin: 0 0 10px; color: #78859e; font-size: 10px;
+        font-weight: 750; letter-spacing: .13em; text-transform: uppercase;
+      }
+      .conversation-field, .composer-input {
+        width: 100%; min-width: 0; padding: 11px 12px;
+        border: 1px solid #2a3449; border-radius: 10px;
+        outline: none; background: #111925; color: #eef2ff;
+        transition: border-color .16s, box-shadow .16s;
+      }
+      .conversation-field { font-size: 12px; }
+      input::placeholder { color: #6d7890; }
+      input:focus { border-color: #7888ff; box-shadow: 0 0 0 3px #7183ff1c; }
+      .side-actions { display: grid; gap: 8px; margin-top: 9px; }
+      button {
+        min-height: 39px; display: inline-flex; align-items: center;
+        justify-content: center; gap: 8px; padding: 9px 12px;
+        border: 1px solid transparent; border-radius: 10px;
+        background: #5d70f5; color: white; font-size: 12px;
+        font-weight: 700; cursor: pointer;
+        transition: background .16s, border-color .16s, transform .16s;
+      }
+      button:not(:disabled):hover { transform: translateY(-1px); background: #7181ff; }
+      button.secondary { border-color: #2b3549; background: #192231; color: #cbd4e8; }
+      button.secondary:not(:disabled):hover { border-color: #465371; background: #202c3e; }
+      button.danger { border-color: #57333e; background: #2a1d27; color: #f0b5c2; }
+      button.danger:not(:disabled):hover { background: #472633; }
+      button:disabled, input:disabled { opacity: .48; cursor: not-allowed; }
+      .side-note {
+        margin-top: auto; padding: 12px; border: 1px solid #242e41;
+        border-radius: 12px; background: #131c29; color: #8d9ab1;
+        font-size: 11px; line-height: 1.55;
+      }
+      .side-note strong { display: block; margin-bottom: 4px; color: #c9d2e6; }
+      .workspace { min-width: 0; display: flex; flex-direction: column; }
+      .topbar {
+        min-height: 77px; display: flex; align-items: center;
+        justify-content: space-between; gap: 16px; padding: 16px 25px;
+        border-bottom: 1px solid #252d40;
+      }
+      h1 { margin: 0; font-size: 16px; font-weight: 720; letter-spacing: -.01em; }
+      .top-caption { margin-top: 5px; color: #8290a9; font-size: 11px; }
+      .connection {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 7px 10px; border: 1px solid #293547; border-radius: 999px;
+        background: #151f2c; color: #a8b5cc; font-size: 11px;
+      }
+      .connection::before {
+        width: 7px; height: 7px; border-radius: 50%; background: #65728a;
+        content: "";
+      }
+      .connection.online::before { background: #57d6a0; box-shadow: 0 0 10px #57d6a088; }
+      .connection.active::before { background: #7d8cff; box-shadow: 0 0 10px #7d8cffaa; }
+      #messages {
+        flex: 1; overflow: auto; padding: 28px clamp(18px, 6vw, 76px);
+        scroll-behavior: smooth;
+      }
+      .empty-state {
+        max-width: 440px; margin: clamp(45px, 12vh, 130px) auto 0;
+        text-align: center;
+      }
+      .orb {
+        width: 64px; height: 64px; display: grid; place-items: center;
+        margin: 0 auto 19px; border: 1px solid #7787ff55; border-radius: 22px;
+        background: radial-gradient(circle at 30% 25%, #8191ff, #575ed2 58%, #56399a);
+        color: white; font-size: 26px; box-shadow: 0 12px 35px #697aff30;
+      }
+      .empty-state h2 { margin: 0; font-size: 20px; letter-spacing: -.025em; }
+      .empty-state p { margin: 9px 0 0; color: #929fb6; font-size: 13px; line-height: 1.65; }
+      .suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 22px; }
+      .suggestion {
+        padding: 8px 11px; border: 1px solid #29344a; border-radius: 999px;
+        background: #151e2b; color: #abb7cd; font-size: 11px;
+      }
+      .message { max-width: min(680px, 88%); margin: 0 0 18px; animation: arrive .2s ease-out; }
+      @keyframes arrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+      .message .label { margin: 0 0 6px 3px; color: #8794ab; font-size: 10px; font-weight: 700; }
+      .bubble {
+        padding: 12px 15px; border: 1px solid #293346; border-radius: 4px 15px 15px;
+        background: #192231; color: #e4eaf6; font-size: 13px;
+        white-space: pre-wrap; line-height: 1.65; overflow-wrap: anywhere;
+      }
+      .user { margin-left: auto; }
+      .user .label { text-align: right; margin-right: 3px; }
+      .user .bubble { border-color: #5f70e4; border-radius: 15px 4px 15px 15px; background: #4a5bd0; color: white; }
+      .error .bubble { border-color: #663944; background: #351f29; color: #ffc2c2; }
+      .partial .bubble { border-style: dashed; color: #aebbd2; font-style: italic; }
+      #summary {
+        display: none; margin: 0 26px 12px; padding: 12px 14px;
+        border: 1px solid #34405a; border-radius: 12px;
+        background: #161f2e; color: #bbc7dc; font-size: 11px; line-height: 1.55;
+      }
+      .composer-wrap { padding: 15px 24px 18px; border-top: 1px solid #252d40; background: #111722; }
+      form { display: flex; align-items: center; gap: 9px; max-width: 800px; margin: 0 auto; }
+      .composer-input { flex: 1; min-height: 46px; padding: 12px 15px; border-radius: 13px; font-size: 13px; }
+      #send { min-width: 75px; min-height: 43px; }
+      .composer-hint { margin: 8px 4px 0; color: #69758b; font-size: 10px; }
+      @media (max-width: 760px) {
+        body { padding: 0; }
+        .shell { width: 100%; height: 100dvh; min-height: 500px; border: 0; border-radius: 0; grid-template-columns: 220px minmax(0, 1fr); }
+        .sidebar { padding: 20px 13px 14px; }
+        .topbar { padding: 14px 18px; }
+        #messages { padding: 22px 18px; }
+        .composer-wrap { padding: 12px 16px 15px; }
+      }
+      @media (max-width: 560px) {
+        .shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+        .sidebar { display: grid; grid-template-columns: 1fr; align-items: center; gap: 10px; padding: 11px 15px; border-right: 0; border-bottom: 1px solid #252d40; }
+        .brand { gap: 9px; }
+        .brand-mark { width: 34px; height: 34px; }
+        .brand-caption, .side-note, .side-heading { display: none; }
+        .sidebar section { display: flex; align-items: center; gap: 7px; min-width: 0; }
+        .sidebar section > div:first-child { flex: 1; min-width: 0; }
+        .conversation-field { width: 100%; padding: 9px; }
+        .side-actions { display: flex; flex-shrink: 0; gap: 5px; margin: 0; }
+        #start { min-height: 36px; padding: 8px 9px; font-size: 10px; }
+        #select, .top-caption { display: none; }
+        #interrupt, #stop { width: 35px; min-width: 35px; min-height: 36px; padding: 6px; font-size: 0; }
+        #interrupt::after { content: "↻"; font-size: 15px; }
+        #stop::after { content: "■"; font-size: 12px; }
+        .workspace { min-height: 0; }
+        .topbar { min-height: 62px; padding: 11px 16px; }
+        h1 { font-size: 14px; }
+        .connection { padding: 6px 8px; font-size: 10px; }
+        #messages { padding: 18px 14px; }
+        .message { max-width: 94%; }
+        .empty-state { margin-top: 13vh; }
+        .empty-state h2 { font-size: 18px; }
+        .composer-wrap { padding: 10px 12px 13px; }
+        #send { min-width: 62px; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">a</div>
+          <div>
+            <div class="brand-name">AssemblyAI</div>
+            <div class="brand-caption">VOICE STUDIO</div>
+          </div>
+        </div>
+        <section aria-label="Conversation controls">
+          <div>
+            <h2 class="side-heading">Conversation</h2>
+            <input id="conversation-id" class="conversation-field"
+                   placeholder="ID or create new" aria-label="Conversation ID">
+          </div>
+          <div class="side-actions">
+            <button id="start" type="button" disabled><span aria-hidden="true">＋</span> Start voice</button>
+            <button id="select" class="secondary" type="button" disabled>Select existing</button>
+            <button id="interrupt" class="secondary" type="button" disabled>Interrupt agent</button>
+            <button id="stop" class="danger" type="button" disabled>Stop listening</button>
+          </div>
+        </section>
+        <div class="side-note">
+          <strong>Hands-free conversation</strong>
+          Speak naturally. The agent listens, responds with voice, and can be interrupted at any time.
+        </div>
+      </aside>
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Voice assistant</h1>
+            <div class="top-caption">A natural conversation, in real time</div>
+          </div>
+          <div id="status" class="connection" role="status">Connecting…</div>
+        </header>
+        <section id="messages" aria-live="polite">
+          <div class="empty-state" id="empty-state">
+            <div class="orb" aria-hidden="true">✦</div>
+            <h2>What can I help you with?</h2>
+            <p>Start a voice conversation or type a message. Your agent will respond with a natural voice.</p>
+            <div class="suggestions" aria-hidden="true">
+              <span class="suggestion">Plan my day</span>
+              <span class="suggestion">Explain a concept</span>
+              <span class="suggestion">Brainstorm an idea</span>
+            </div>
+          </div>
+        </section>
+        <div id="summary" aria-live="polite"></div>
+        <div class="composer-wrap">
+          <form id="composer">
+            <input id="prompt" class="composer-input" autocomplete="off" maxlength="4000"
+                   placeholder="Type a message…" aria-label="Typed message">
+            <button id="send" type="submit" disabled>Send <span aria-hidden="true">↑</span></button>
+          </form>
+          <div class="composer-hint">Enter to send · Use the microphone controls to talk</div>
+        </div>
+      </section>
+    </main>
+    <script>
+      const statusNode = document.querySelector("#status");
+      const messagesNode = document.querySelector("#messages");
+      const summaryNode = document.querySelector("#summary");
+      const form = document.querySelector("#composer");
+      const promptInput = document.querySelector("#prompt");
+      const conversationInput = document.querySelector("#conversation-id");
+      const sendButton = document.querySelector("#send");
+      const startButton = document.querySelector("#start");
+      const selectButton = document.querySelector("#select");
+      const interruptButton = document.querySelector("#interrupt");
+      const stopButton = document.querySelector("#stop");
+      const websocketScheme = location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(`${websocketScheme}//${location.host}/ws`);
+      socket.binaryType = "arraybuffer";
+
+      const assistantBubbles = new Map();
+      const partialBubbles = new Map();
+      const audioSources = new Set();
+      let audioContext;
+      let scheduledUntil = 0;
+      let worklet;
+      let microphoneSource;
+      let microphoneStream;
+      let recording = false;
+      let busy = false;
+      let conversationActive = false;
+      let startRequested = false;
+      let latestState = "listening";
+
+      function setStatus(text) {
+        statusNode.textContent = text;
+        statusNode.classList.toggle("online", socket.readyState === WebSocket.OPEN);
+        statusNode.classList.toggle(
+          "active",
+          recording || latestState === "thinking" || latestState === "speaking",
+        );
+      }
+
+      function addMessage(role, text = "", id = "") {
+        document.querySelector("#empty-state")?.remove();
+        const wrapper = document.createElement("article");
+        wrapper.className = `message ${role}`;
+        if (id) wrapper.dataset.id = id;
+        const label = document.createElement("div");
+        label.className = "label";
+        label.textContent = role === "user" ? "You" : role === "error" ? "Error" : "Agent";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+        wrapper.append(label, bubble);
+        messagesNode.append(wrapper);
+        messagesNode.scrollTop = messagesNode.scrollHeight;
+        return bubble;
+      }
+
+      function setBusy(value) {
+        busy = value;
+        sendButton.disabled = value
+          || !conversationActive
+          || socket.readyState !== WebSocket.OPEN;
+        promptInput.disabled = value;
+      }
+
+      async function ensureAudioContext() {
+        audioContext ??= new AudioContext();
+        await audioContext.resume();
+      }
+
+      async function startMicrophone() {
+        if (recording) return;
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error("Microphone access requires HTTPS or localhost.");
+        }
+        await ensureAudioContext();
+        microphoneStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        await audioContext.audioWorklet.addModule("/pcm-worklet.js");
+        microphoneSource = audioContext.createMediaStreamSource(microphoneStream);
+        worklet = new AudioWorkletNode(audioContext, "pcm-worklet", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+        worklet.port.onmessage = ({ data }) => {
+          if (recording && socket.readyState === WebSocket.OPEN) {
+            socket.send(data);
+          }
+        };
+        microphoneSource.connect(worklet);
+        worklet.connect(audioContext.destination);
+        recording = true;
+      }
+
+      function stopMicrophone() {
+        recording = false;
+        worklet?.disconnect();
+        microphoneSource?.disconnect();
+        microphoneStream?.getTracks().forEach((track) => track.stop());
+        worklet = null;
+        microphoneSource = null;
+        microphoneStream = null;
+      }
+
+      function stopPlayback() {
+        for (const source of audioSources) {
+          try { source.stop(); } catch { /* Already stopped. */ }
+        }
+        audioSources.clear();
+        scheduledUntil = 0;
+      }
+
+      async function playPcm(arrayBuffer) {
+        if (!audioContext || arrayBuffer.byteLength < 2) return;
+        const sampleCount = Math.floor(arrayBuffer.byteLength / 2);
+        const view = new DataView(arrayBuffer);
+        const buffer = audioContext.createBuffer(1, sampleCount, 24000);
+        const samples = buffer.getChannelData(0);
+        for (let index = 0; index < sampleCount; index += 1) {
+          samples[index] = view.getInt16(index * 2, true) / 32768;
+        }
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        const startAt = Math.max(audioContext.currentTime, scheduledUntil);
+        source.start(startAt);
+        scheduledUntil = startAt + buffer.duration;
+        audioSources.add(source);
+        source.addEventListener("ended", () => audioSources.delete(source), { once: true });
+      }
+
+      function sendJson(payload) {
+        if (socket.readyState !== WebSocket.OPEN) {
+          setStatus("WebSocket is not connected.");
+          return false;
+        }
+        socket.send(JSON.stringify(payload));
+        return true;
+      }
+
+      async function startConversation(selectExisting = false) {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        stopMicrophone();
+        stopPlayback();
+        try {
+          await ensureAudioContext();
+        } catch (error) {
+          addMessage("error", error.message);
+          return;
+        }
+        const id = conversationInput.value.trim() || crypto.randomUUID();
+        conversationInput.value = id;
+        const sent = sendJson({
+          type: selectExisting ? "select_conversation" : "start",
+          conversationId: id,
+        });
+        if (!sent) return;
+        startRequested = true;
+        conversationActive = false;
+        startButton.disabled = true;
+        selectButton.disabled = true;
+        setBusy(false);
+        setStatus(`Opening conversation · ${id}`);
+      }
+
+      socket.addEventListener("open", () => {
+        setStatus("Connected. Start or select a conversation.");
+        startButton.disabled = false;
+        selectButton.disabled = false;
+      });
+      socket.addEventListener("close", () => {
+        stopMicrophone();
+        stopPlayback();
+        conversationActive = false;
+        startRequested = false;
+        setStatus("Disconnected. Refresh to reconnect.");
+        startButton.disabled = true;
+        selectButton.disabled = true;
+        interruptButton.disabled = true;
+        stopButton.disabled = true;
+        setBusy(true);
+      });
+      socket.addEventListener("error", () => setStatus("WebSocket connection error."));
+      socket.addEventListener("message", async (event) => {
+        if (typeof event.data !== "string") {
+          await playPcm(event.data);
+          return;
+        }
+        const message = JSON.parse(event.data);
+        if (message.type === "state") {
+          latestState = message.state;
+          if (message.state === "listening") {
+            conversationActive = true;
+            startButton.disabled = false;
+            selectButton.disabled = false;
+            setBusy(false);
+            if (startRequested && !recording) {
+              startRequested = false;
+              try {
+                await startMicrophone();
+                stopButton.disabled = false;
+                interruptButton.disabled = false;
+              } catch (error) {
+                conversationActive = true;
+                setBusy(false);
+                stopButton.disabled = false;
+                interruptButton.disabled = false;
+                addMessage("error", error.message);
+                setStatus("Microphone unavailable. You can type instead.");
+                return;
+              }
+            }
+          } else if (message.state === "thinking" || message.state === "speaking") {
+            setBusy(true);
+          } else if (message.state === "interrupted") {
+            setBusy(false);
+          }
+          setStatus(message.state === "listening" && recording
+            ? `Listening · ${conversationInput.value}`
+            : message.state[0].toUpperCase() + message.state.slice(1));
+          if (message.state === "interrupted") stopPlayback();
+          if (message.state === "listening" && conversationActive) {
+            stopButton.disabled = false;
+            interruptButton.disabled = false;
+          }
+        } else if (message.type === "user_partial") {
+          let bubble = partialBubbles.get(message.turn);
+          if (!bubble) {
+            bubble = addMessage("partial", "", String(message.turn));
+            partialBubbles.set(message.turn, bubble);
+          }
+          bubble.textContent = message.text;
+          messagesNode.scrollTop = messagesNode.scrollHeight;
+        } else if (message.type === "user_final") {
+          const partial = partialBubbles.get(message.turn);
+          if (partial) {
+            partial.closest(".message").remove();
+            partialBubbles.delete(message.turn);
+          }
+          addMessage("user", message.text);
+        } else if (message.type === "assistant_delta") {
+          let bubble = assistantBubbles.get(message.messageId);
+          if (!bubble) {
+            bubble = addMessage("assistant", "", message.messageId);
+            assistantBubbles.set(message.messageId, bubble);
+          }
+          bubble.textContent += message.text;
+          messagesNode.scrollTop = messagesNode.scrollHeight;
+        } else if (message.type === "assistant_final") {
+          const bubble = assistantBubbles.get(message.messageId);
+          if (bubble && message.interrupted) {
+            bubble.textContent += " [interrupted]";
+          }
+          assistantBubbles.delete(message.messageId);
+        } else if (message.type === "summary_updated") {
+          summaryNode.style.display = "block";
+          summaryNode.textContent = `Conversation summary v${message.version}: ${message.text}`;
+        } else if (message.type === "error") {
+          if (startRequested) {
+            startRequested = false;
+            startButton.disabled = false;
+            selectButton.disabled = false;
+          }
+          addMessage("error", `${message.code}: ${message.message}`);
+          setStatus("Request failed.");
+        }
+      });
+
+      startButton.addEventListener("click", () => startConversation(false));
+      selectButton.addEventListener("click", () => startConversation(true));
+      interruptButton.addEventListener("click", () => {
+        sendJson({ type: "interrupt" });
+        stopPlayback();
+      });
+      stopButton.addEventListener("click", () => {
+        sendJson({ type: "stop" });
+        stopMicrophone();
+        conversationActive = false;
+        startRequested = false;
+        stopButton.disabled = true;
+        interruptButton.disabled = true;
+        setBusy(false);
+      });
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const text = promptInput.value.trim();
+        if (!text || busy || !conversationActive) return;
+        if (sendJson({ type: "text", text })) {
+          promptInput.value = "";
+        }
+      });
+      window.addEventListener("beforeunload", () => {
+        stopMicrophone();
+        if (socket.readyState === WebSocket.OPEN) socket.close();
+      });
+    </script>
+  </body>
+</html>

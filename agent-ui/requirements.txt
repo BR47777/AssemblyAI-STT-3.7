@@ -1,0 +1,6 @@
+assemblyai
+fastapi
+infisicalsdk
+openai
+sounddevice
+uvicorn[standard]
