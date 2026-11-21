@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import assemblyai as aai
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from openai import (
     AsyncOpenAI,
     AuthenticationError,
@@ -418,6 +418,70 @@ async def pcm_worklet() -> FileResponse:
 @app.get("/healthz")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/conversations")
+async def list_conversations() -> dict[str, list[dict[str, str | int]]]:
+    store = ConversationStore(HISTORY_DB)
+    try:
+        return {"conversations": store.list_conversations()}
+    finally:
+        store.close()
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str,
+) -> dict[str, str | list[dict[str, str | int | bool]]]:
+    store = ConversationStore(HISTORY_DB)
+    try:
+        if not store.exists(conversation_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return {
+            "id": conversation_id,
+            "messages": store.conversation_messages(conversation_id),
+        }
+    finally:
+        store.close()
+
+
+@app.get("/api/conversations/{conversation_id}/transcript.txt")
+async def download_transcript(conversation_id: str) -> PlainTextResponse:
+    store = ConversationStore(HISTORY_DB)
+    try:
+        if not store.exists(conversation_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        messages = store.conversation_messages(conversation_id)
+        lines = [
+            "Conversation transcript",
+            f"Conversation ID: {conversation_id}",
+            "Times are in UTC.",
+            "",
+        ]
+        for message in messages:
+            timestamp = str(message["created_at"])
+            if timestamp.endswith("+00:00"):
+                timestamp = f"{timestamp[:-6]}Z"
+            speaker = "You" if message["role"] == "user" else "Assistant"
+            interrupted = " [interrupted]" if message["interrupted"] else ""
+            lines.extend(
+                [
+                    f"{timestamp} | {speaker}{interrupted}:",
+                    str(message["content"]),
+                    "",
+                ]
+            )
+        filename_id = re.sub(r"[^A-Za-z0-9_-]", "_", conversation_id)
+        return PlainTextResponse(
+            "\n".join(lines),
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="conversation-{filename_id}.txt"'
+                )
+            },
+        )
+    finally:
+        store.close()
 
 
 @app.websocket("/ws")

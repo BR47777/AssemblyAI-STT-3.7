@@ -40,6 +40,7 @@
         display: flex;
         flex-direction: column;
         gap: 26px;
+        min-height: 0;
         padding: 25px 18px 18px;
         border-right: 1px solid #252d40;
         background: #0e141f;
@@ -73,6 +74,20 @@
       input::placeholder { color: #6d7890; }
       input:focus { border-color: #7888ff; box-shadow: 0 0 0 3px #7183ff1c; }
       .side-actions { display: grid; gap: 8px; margin-top: 9px; }
+      .history-panel { display: flex; flex: 1; flex-direction: column; min-height: 100px; gap: 8px; }
+      .history-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .history-heading .side-heading { margin: 0; }
+      #refresh-history { min-height: 30px; padding: 5px 8px; font-size: 10px; }
+      .history-list { min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 6px; }
+      .history-list p { margin: 0; color: #7d8aa4; font-size: 11px; line-height: 1.5; }
+      .history-item {
+        width: 100%; min-height: 0; display: grid; justify-items: start; gap: 3px;
+        padding: 9px 10px; border: 1px solid #252f43; background: #121b28;
+        color: #d3dcef; text-align: left;
+      }
+      .history-item:not(:disabled):hover { background: #1a2636; }
+      .history-title { width: 100%; overflow: hidden; color: inherit; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+      .history-meta { color: #7d8aa4; font-size: 9px; font-weight: 500; }
       button {
         min-height: 39px; display: inline-flex; align-items: center;
         justify-content: center; gap: 8px; padding: 9px 12px;
@@ -112,6 +127,8 @@
       }
       .connection.online::before { background: #57d6a0; box-shadow: 0 0 10px #57d6a088; }
       .connection.active::before { background: #7d8cff; box-shadow: 0 0 10px #7d8cffaa; }
+      .topbar-actions { display: flex; align-items: center; gap: 9px; }
+      #download-transcript { min-height: 34px; padding: 7px 10px; font-size: 10px; }
       #messages {
         flex: 1; overflow: auto; padding: 28px clamp(18px, 6vw, 76px);
         scroll-behavior: smooth;
@@ -172,6 +189,9 @@
         .brand-caption, .side-note, .side-heading { display: none; }
         .sidebar section { display: flex; align-items: center; gap: 7px; min-width: 0; }
         .sidebar section > div:first-child { flex: 1; min-width: 0; }
+        .history-panel { min-height: 0; max-height: 104px; }
+        .history-list { display: flex; overflow-x: auto; overflow-y: hidden; }
+        .history-item { min-width: 150px; }
         .conversation-field { width: 100%; padding: 9px; }
         .side-actions { display: flex; flex-shrink: 0; gap: 5px; margin: 0; }
         #start { min-height: 36px; padding: 8px 9px; font-size: 10px; }
@@ -180,7 +200,13 @@
         #interrupt::after { content: "↻"; font-size: 15px; }
         #stop::after { content: "■"; font-size: 12px; }
         .workspace { min-height: 0; }
-        .topbar { min-height: 62px; padding: 11px 16px; }
+        .topbar { min-height: 62px; gap: 6px; padding: 11px 10px; }
+        .topbar-actions { gap: 5px; }
+        #download-transcript {
+          width: 34px; min-height: 32px; padding: 5px;
+          font-size: 0;
+        }
+        #download-transcript::before { content: "↓"; font-size: 15px; }
         h1 { font-size: 14px; }
         .connection { padding: 6px 8px; font-size: 10px; }
         #messages { padding: 18px 14px; }
@@ -240,6 +266,15 @@
             <button id="stop" class="danger" type="button" disabled>Stop listening</button>
           </div>
         </section>
+        <div class="history-panel">
+          <div class="history-heading">
+            <h2 class="side-heading">Conversation history</h2>
+            <button id="refresh-history" class="secondary" type="button">Refresh</button>
+          </div>
+          <div id="conversation-list" class="history-list" aria-label="Saved conversations">
+            <p>Loading saved conversations…</p>
+          </div>
+        </div>
         <div class="side-note">
           <strong>Hands-free conversation</strong>
           Speak naturally. The agent listens, responds with voice, and can be interrupted at any time.
@@ -251,7 +286,13 @@
             <h1>Voice assistant</h1>
             <div class="top-caption">A natural conversation, in real time</div>
           </div>
-          <div id="status" class="connection" role="status">Connecting…</div>
+          <div class="topbar-actions">
+            <button id="download-transcript" class="secondary" type="button"
+                    aria-label="Download transcript" title="Download transcript" disabled>
+              Download transcript
+            </button>
+            <div id="status" class="connection" role="status">Connecting…</div>
+          </div>
         </header>
         <section id="messages" aria-live="polite">
           <div class="empty-state" id="empty-state">
@@ -294,6 +335,9 @@
       const connectKeysButton = document.querySelector("#connect-keys");
       const forgetKeysButton = document.querySelector("#forget-keys");
       const keyNote = document.querySelector("#key-note");
+      const historyListNode = document.querySelector("#conversation-list");
+      const refreshHistoryButton = document.querySelector("#refresh-history");
+      const downloadTranscriptButton = document.querySelector("#download-transcript");
       const assemblyKeyStorageKey = "assemblyai-stt-voice.assemblyai-key";
       const openaiKeyStorageKey = "assemblyai-stt-voice.openai-key";
       const websocketScheme = location.protocol === "https:" ? "wss:" : "ws:";
@@ -322,6 +366,7 @@
       let startRequested = false;
       let credentialsValidated = false;
       let latestState = "listening";
+      let selectedConversationId = "";
 
       function setStatus(text) {
         statusNode.textContent = text;
@@ -333,6 +378,7 @@
       }
 
       function addMessage(role, text = "", id = "") {
+        const shouldFollow = isNearBottom();
         document.querySelector("#empty-state")?.remove();
         const wrapper = document.createElement("article");
         wrapper.className = `message ${role}`;
@@ -345,8 +391,107 @@
         bubble.textContent = text;
         wrapper.append(label, bubble);
         messagesNode.append(wrapper);
-        messagesNode.scrollTop = messagesNode.scrollHeight;
+        if (shouldFollow) messagesNode.scrollTop = messagesNode.scrollHeight;
         return bubble;
+      }
+
+      function isNearBottom() {
+        return messagesNode.scrollHeight - messagesNode.scrollTop - messagesNode.clientHeight < 48;
+      }
+
+      function renderConversation(messages) {
+        clearMessages();
+        for (const message of messages) {
+          const text = message.content
+            + (message.role === "assistant" && message.interrupted ? " [interrupted]" : "");
+          addMessage(message.role, text);
+        }
+        messagesNode.scrollTop = 0;
+      }
+
+      function clearMessages() {
+        messagesNode.replaceChildren();
+        assistantBubbles.clear();
+        partialBubbles.clear();
+      }
+
+      async function fetchConversation(id) {
+        const response = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+        if (!response.ok) {
+          throw new Error(response.status === 404
+            ? "Conversation not found."
+            : "Could not load conversation history.");
+        }
+        return response.json();
+      }
+
+      async function viewConversation(id) {
+        try {
+          const conversation = await fetchConversation(id);
+          if (conversationActive || recording || startRequested) {
+            sendJson({ type: "stop" });
+            stopMicrophone();
+            stopPlayback();
+            conversationActive = false;
+            startRequested = false;
+            stopButton.disabled = true;
+            interruptButton.disabled = true;
+            setBusy(false);
+          }
+          conversationInput.value = conversation.id;
+          selectedConversationId = conversation.id;
+          renderConversation(conversation.messages);
+          summaryNode.style.display = "none";
+          downloadTranscriptButton.disabled = conversation.messages.length === 0;
+          setStatus(`Viewing saved conversation · ${conversation.id}`);
+        } catch (error) {
+          addMessage("error", error.message);
+        }
+      }
+
+      async function refreshConversationList() {
+        historyListNode.replaceChildren();
+        const loading = document.createElement("p");
+        loading.textContent = "Loading saved conversations…";
+        historyListNode.append(loading);
+        try {
+          const response = await fetch("/api/conversations");
+          if (!response.ok) throw new Error("Could not load saved conversations.");
+          const data = await response.json();
+          historyListNode.replaceChildren();
+          if (data.conversations.length === 0) {
+            const empty = document.createElement("p");
+            empty.textContent = "No saved conversations yet.";
+            historyListNode.append(empty);
+            return;
+          }
+          for (const conversation of data.conversations) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "history-item";
+            button.setAttribute("aria-label", `View ${conversation.title}`);
+            const title = document.createElement("span");
+            title.className = "history-title";
+            title.textContent = conversation.title;
+            const meta = document.createElement("span");
+            meta.className = "history-meta";
+            meta.textContent = `${conversation.message_count} messages · ${new Date(conversation.updated_at).toLocaleString()}`;
+            button.append(title, meta);
+            button.addEventListener("click", () => viewConversation(conversation.id));
+            historyListNode.append(button);
+            if (conversation.id === selectedConversationId) {
+              downloadTranscriptButton.disabled = conversation.message_count === 0;
+            }
+          }
+          if (!data.conversations.some(({ id }) => id === selectedConversationId)) {
+            downloadTranscriptButton.disabled = true;
+          }
+        } catch (error) {
+          historyListNode.replaceChildren();
+          const failed = document.createElement("p");
+          failed.textContent = error.message;
+          historyListNode.append(failed);
+        }
       }
 
       function setBusy(value) {
@@ -495,17 +640,28 @@
         stopPlayback();
         try {
           await ensureAudioContext();
+          const id = conversationInput.value.trim() || crypto.randomUUID();
+          if (selectExisting) {
+            const conversation = await fetchConversation(id);
+            selectedConversationId = conversation.id;
+            renderConversation(conversation.messages);
+            messagesNode.scrollTop = messagesNode.scrollHeight;
+          } else {
+            selectedConversationId = id;
+            clearMessages();
+            downloadTranscriptButton.disabled = true;
+          }
+          conversationInput.value = id;
+          const sent = sendJson({
+            type: selectExisting ? "select_conversation" : "start",
+            conversationId: id,
+          });
+          if (!sent) return;
         } catch (error) {
           addMessage("error", error.message);
           return;
         }
-        const id = conversationInput.value.trim() || crypto.randomUUID();
-        conversationInput.value = id;
-        const sent = sendJson({
-          type: selectExisting ? "select_conversation" : "start",
-          conversationId: id,
-        });
-        if (!sent) return;
+        void refreshConversationList();
         startRequested = true;
         conversationActive = false;
         startButton.disabled = true;
@@ -517,6 +673,7 @@
       socket.addEventListener("open", () => {
         setStatus("Enter both API keys, then connect.");
         connectKeysButton.disabled = false;
+        void refreshConversationList();
       });
       socket.addEventListener("close", () => {
         stopMicrophone();
@@ -588,8 +745,9 @@
             bubble = addMessage("partial", "", String(message.turn));
             partialBubbles.set(message.turn, bubble);
           }
+          const shouldFollow = isNearBottom();
           bubble.textContent = message.text;
-          messagesNode.scrollTop = messagesNode.scrollHeight;
+          if (shouldFollow) messagesNode.scrollTop = messagesNode.scrollHeight;
         } else if (message.type === "user_final") {
           const partial = partialBubbles.get(message.turn);
           if (partial) {
@@ -597,20 +755,23 @@
             partialBubbles.delete(message.turn);
           }
           addMessage("user", message.text);
+          void refreshConversationList();
         } else if (message.type === "assistant_delta") {
           let bubble = assistantBubbles.get(message.messageId);
           if (!bubble) {
             bubble = addMessage("assistant", "", message.messageId);
             assistantBubbles.set(message.messageId, bubble);
           }
+          const shouldFollow = isNearBottom();
           bubble.textContent += message.text;
-          messagesNode.scrollTop = messagesNode.scrollHeight;
+          if (shouldFollow) messagesNode.scrollTop = messagesNode.scrollHeight;
         } else if (message.type === "assistant_final") {
           const bubble = assistantBubbles.get(message.messageId);
           if (bubble && message.interrupted) {
             bubble.textContent += " [interrupted]";
           }
           assistantBubbles.delete(message.messageId);
+          void refreshConversationList();
         } else if (message.type === "summary_updated") {
           summaryNode.style.display = "block";
           summaryNode.textContent = `Conversation summary v${message.version}: ${message.text}`;
@@ -633,6 +794,13 @@
 
       startButton.addEventListener("click", () => startConversation(false));
       selectButton.addEventListener("click", () => startConversation(true));
+      refreshHistoryButton.addEventListener("click", refreshConversationList);
+      downloadTranscriptButton.addEventListener("click", () => {
+        if (!selectedConversationId || downloadTranscriptButton.disabled) return;
+        const link = document.createElement("a");
+        link.href = `/api/conversations/${encodeURIComponent(selectedConversationId)}/transcript.txt`;
+        link.click();
+      });
       interruptButton.addEventListener("click", () => {
         sendJson({ type: "interrupt" });
         stopPlayback();
@@ -658,6 +826,7 @@
         stopMicrophone();
         if (socket.readyState === WebSocket.OPEN) socket.close();
       });
+      void refreshConversationList();
     </script>
   </body>
 </html>

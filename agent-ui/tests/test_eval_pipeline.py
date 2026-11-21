@@ -138,8 +138,20 @@ def _install_sdk_stubs():
         def websocket(self, *_args, **_kwargs):
             return lambda function: function
 
+    class _HTTPException(Exception):
+        def __init__(self, *, status_code, detail):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class _PlainTextResponse:
+        def __init__(self, content, *, headers=None):
+            self.body = content
+            self.headers = headers or {}
+
     fastapi = types.ModuleType("fastapi")
     fastapi.FastAPI = _FastAPI
+    fastapi.HTTPException = _HTTPException
     fastapi.WebSocket = type("WebSocket", (), {})
     fastapi.WebSocketDisconnect = type(
         "WebSocketDisconnect", (Exception,), {}
@@ -147,6 +159,7 @@ def _install_sdk_stubs():
     fastapi_responses = types.ModuleType("fastapi.responses")
     fastapi_responses.HTMLResponse = _Placeholder
     fastapi_responses.FileResponse = _Placeholder
+    fastapi_responses.PlainTextResponse = _PlainTextResponse
 
     sys.modules.update(
         {
@@ -337,6 +350,100 @@ class EvalPipelineTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(module.get_assemblyai_api_key(), "env-key")
+
+    def test_voice_app_exposes_every_saved_conversation_and_message(self):
+        module = MODULES["web_app"]
+        store_module = MODULES["conversation_store"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "history.sqlite")
+            store = store_module.ConversationStore(db_path)
+            try:
+                store.create("older")
+                store.append("older", "user", "First question")
+                store.append(
+                    "older",
+                    "assistant",
+                    "First answer",
+                    interrupted=True,
+                )
+                store.create("newer")
+                store.append("newer", "user", "Another conversation")
+            finally:
+                store.close()
+
+            with mock.patch.object(module, "HISTORY_DB", db_path):
+                conversations = asyncio.run(module.list_conversations())
+                history = asyncio.run(module.get_conversation("older"))
+
+            self.assertEqual(
+                {item["id"] for item in conversations["conversations"]},
+                {"older", "newer"},
+            )
+            self.assertEqual(
+                conversations["conversations"][0]["id"],
+                "newer",
+            )
+            self.assertEqual(
+                [item["content"] for item in history["messages"]],
+                ["First question", "First answer"],
+            )
+            self.assertTrue(history["messages"][1]["interrupted"])
+
+    def test_voice_app_history_returns_not_found_for_unknown_conversation(self):
+        module = MODULES["web_app"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                module,
+                "HISTORY_DB",
+                str(Path(temp_dir) / "history.sqlite"),
+            ):
+                with self.assertRaises(module.HTTPException) as raised:
+                    asyncio.run(module.get_conversation("missing"))
+        self.assertEqual(raised.exception.status_code, 404)
+
+    def test_voice_app_downloads_transcript_with_speakers_and_utc_times(self):
+        module = MODULES["web_app"]
+        store_module = MODULES["conversation_store"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "history.sqlite")
+            store = store_module.ConversationStore(db_path)
+            store.create("call/one")
+            store.append("call/one", "user", "What time is it?")
+            store.append(
+                "call/one",
+                "assistant",
+                "It is noon.",
+                interrupted=True,
+            )
+            store.close()
+
+            with mock.patch.object(module, "HISTORY_DB", db_path):
+                transcript = asyncio.run(module.download_transcript("call/one"))
+
+            self.assertIn("You:", transcript.body)
+            self.assertIn("Assistant [interrupted]:", transcript.body)
+            self.assertIn("What time is it?", transcript.body)
+            self.assertIn("It is noon.", transcript.body)
+            self.assertRegex(
+                transcript.body,
+                r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z \| You:",
+            )
+            self.assertEqual(
+                transcript.headers["Content-Disposition"],
+                'attachment; filename="conversation-call_one.txt"',
+            )
+
+    def test_voice_app_transcript_download_returns_not_found(self):
+        module = MODULES["web_app"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                module,
+                "HISTORY_DB",
+                str(Path(temp_dir) / "history.sqlite"),
+            ):
+                with self.assertRaises(module.HTTPException) as raised:
+                    asyncio.run(module.download_transcript("missing"))
+        self.assertEqual(raised.exception.status_code, 404)
 
     def test_assemblyai_key_is_loaded_from_infisical(self):
         module = MODULES["infisical_secrets"]

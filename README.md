@@ -218,6 +218,11 @@ is sent as binary frames. Errors carry a `code` and user-facing `message`.
 The app defaults to `agent_ui_history.db` in the current working directory.
 Use `HISTORY_DB` to change the path. Conversation history and summaries are
 local application data; API keys are not stored in these tables.
+The sidebar lists all saved conversations and lets you view their complete
+message history. The transcript follows new messages only while you are
+already at the bottom, so you can scroll up without being pulled back down.
+Select a conversation and choose **Download transcript** to save a text file
+with each speaker, the message timestamp in UTC, and interruption markers.
 
 ## Standalone demos
 

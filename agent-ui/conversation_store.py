@@ -66,6 +66,66 @@ class ConversationStore:
             is not None
         )
 
+    def list_conversations(self) -> list[dict[str, str | int]]:
+        rows = self.db.execute(
+            """
+            SELECT
+                conversations.id,
+                conversations.created_at,
+                conversations.updated_at,
+                COUNT(messages.id) AS message_count,
+                COALESCE(
+                    (
+                        SELECT content
+                        FROM messages AS first_message
+                        WHERE first_message.conversation_id = conversations.id
+                            AND first_message.role = 'user'
+                        ORDER BY first_message.id
+                        LIMIT 1
+                    ),
+                    'New conversation'
+                ) AS title
+            FROM conversations
+            LEFT JOIN messages ON messages.conversation_id = conversations.id
+            GROUP BY conversations.id
+            ORDER BY conversations.updated_at DESC, conversations.id
+            """
+        ).fetchall()
+        return [
+            {
+                "id": conversation_id,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "message_count": int(message_count),
+                "title": title,
+            }
+            for conversation_id, created_at, updated_at, message_count, title in rows
+        ]
+
+    def conversation_messages(
+        self,
+        conversation_id: str,
+    ) -> list[dict[str, str | int | bool]]:
+        rows = self.db.execute(
+            """
+            SELECT id, role, content, interrupted, created_at
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY id
+            """,
+            (conversation_id,),
+        ).fetchall()
+        return [
+            {
+                "id": int(message_id),
+                "role": role,
+                "content": content,
+                "interrupted": bool(interrupted),
+                "created_at": created_at,
+            }
+            for message_id, role, content, interrupted, created_at in rows
+        ]
+
     def append(
         self,
         conversation_id: str,
