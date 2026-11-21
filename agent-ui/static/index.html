@@ -63,6 +63,7 @@
       .key-panel label { color: #a7b3ca; font-size: 11px; }
       .key-panel .conversation-field { margin-top: 4px; }
       .key-note { margin: 0; color: #7d8aa4; font-size: 10px; line-height: 1.5; }
+      .key-note.error { color: #ffc2c2; }
       .key-actions { display: grid; gap: 6px; }
       .conversation-field, .composer-input {
         width: 100%; min-width: 0; padding: 11px 12px;
@@ -243,7 +244,7 @@
             <input id="openai-key" class="conversation-field" type="password"
                    autocomplete="new-password" maxlength="4096" required>
           </label>
-          <p id="key-note" class="key-note">
+          <p id="key-note" class="key-note" role="alert" aria-live="assertive">
             Keys are remembered in browser storage. Avoid shared devices.
           </p>
           <div class="key-actions">
@@ -615,6 +616,7 @@
           connectKeysButton.disabled = true;
           forgetKeysButton.disabled = false;
           keyNote.textContent = "Connecting. Keys are saved only in this browser.";
+          keyNote.classList.remove("error");
           setStatus("Connecting with API keys…");
         }
       });
@@ -781,6 +783,7 @@
             assemblyKeyInput.disabled = false;
             openaiKeyInput.disabled = false;
             keyNote.textContent = message.message;
+            keyNote.classList.add("error");
           }
           if (startRequested) {
             startRequested = false;
@@ -788,7 +791,7 @@
             selectButton.disabled = false;
           }
           addMessage("error", `${message.code}: ${message.message}`);
-          setStatus("Request failed.");
+          setStatus(credentialsValidated ? "Request failed." : message.message);
         }
       });
 

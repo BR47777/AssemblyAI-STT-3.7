@@ -690,6 +690,96 @@ class EvalPipelineTests(unittest.TestCase):
         self.assertTrue(interrupted)
         self.assertEqual(session.cancel_count, 1)
 
+    def test_stream_turn_retries_transient_openai_rate_limit(self):
+        module = MODULES["web_app"]
+        session = _FakeAsyncTTSSession()
+        websocket = _FakeWebSocket()
+        rate_limit = module.RateLimitError("rate limited")
+        rate_limit.body = {"error": {"code": "rate_limit_exceeded"}}
+        rate_limit.response = types.SimpleNamespace(
+            headers={"retry-after": "0"}
+        )
+
+        class Completions:
+            def __init__(self):
+                self.calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise rate_limit
+                return _FakeStream([_event("Recovered.")])
+
+        completions = Completions()
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        async def run_turn():
+            with mock.patch.object(
+                module.asyncio,
+                "sleep",
+                new=mock.AsyncMock(),
+            ) as sleep:
+                result = await module.stream_turn(
+                    websocket,
+                    session,
+                    client,
+                    [{"role": "user", "content": "test"}],
+                    "rate-limit-retry",
+                    asyncio.Event(),
+                    websocket.send_json,
+                    websocket.send_bytes,
+                )
+                sleep.assert_awaited_once_with(0.0)
+                return result
+
+        reply, interrupted = asyncio.run(run_turn())
+        self.assertEqual(completions.calls, 2)
+        self.assertEqual(reply, "Recovered.")
+        self.assertFalse(interrupted)
+
+    def test_stream_turn_does_not_retry_exhausted_openai_quota(self):
+        module = MODULES["web_app"]
+        session = _FakeAsyncTTSSession()
+        websocket = _FakeWebSocket()
+        quota_error = module.RateLimitError("quota exhausted")
+        quota_error.body = {"error": {"code": "insufficient_quota"}}
+
+        class Completions:
+            calls = 0
+
+            async def create(self, **_kwargs):
+                self.calls += 1
+                raise quota_error
+
+        completions = Completions()
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions)
+        )
+
+        async def run_turn():
+            with mock.patch.object(
+                module.asyncio,
+                "sleep",
+                new=mock.AsyncMock(),
+            ) as sleep:
+                with self.assertRaises(module.RateLimitError):
+                    await module.stream_turn(
+                        websocket,
+                        session,
+                        client,
+                        [{"role": "user", "content": "test"}],
+                        "quota-error",
+                        asyncio.Event(),
+                        websocket.send_json,
+                        websocket.send_bytes,
+                    )
+                sleep.assert_not_awaited()
+
+        asyncio.run(run_turn())
+        self.assertEqual(completions.calls, 1)
+
     def test_websocket_keeps_one_tts_session_open_across_turns(self):
         module = MODULES["web_app"]
         session = _FakeAsyncTTSSession()
@@ -792,6 +882,10 @@ class EvalPipelineTests(unittest.TestCase):
         self.assertEqual(streamed_audio, [b"\x00" * 1_600])
         self.assertEqual(
             client.completions.calls[0]["messages"][-1]["role"], "user"
+        )
+        self.assertIn(
+            "same language as the user's latest message",
+            client.completions.calls[0]["messages"][0]["content"],
         )
         self.assertEqual(
             client.completions.calls[1]["messages"][-2],

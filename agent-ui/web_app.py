@@ -38,6 +38,8 @@ MIC_FRAME_BYTES = 1_600
 MAX_MESSAGE_CHARS = 4_000
 MAX_API_KEY_CHARS = 4_096
 MAX_SPEECH_CHARS = 240
+OPENAI_RATE_LIMIT_RETRIES = 2
+MAX_OPENAI_RETRY_DELAY = 5
 SENTENCE_PATTERN = re.compile(
     r".+?[.!?](?:[\"')\]]+)?(?:\s+|$)",
     re.DOTALL,
@@ -47,8 +49,9 @@ HISTORY_DB = os.getenv("HISTORY_DB", "agent_ui_history.db")
 SYSTEM_MESSAGE = {
     "role": "system",
     "content": (
-        "You are a concise voice assistant. Use natural, complete sentences "
-        "and avoid Markdown."
+        "You are a concise voice assistant. Reply in the same language as the "
+        "user's latest message, switching languages whenever the user does. "
+        "Use natural, complete sentences and avoid Markdown."
     ),
 }
 
@@ -136,6 +139,29 @@ def validate_assemblyai_api_key(api_key: str) -> None:
     finally:
         if client is not None:
             client.close()
+
+
+def openai_rate_limit_code(error: RateLimitError) -> str | None:
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return None
+    details = body.get("error", body)
+    if not isinstance(details, dict):
+        return None
+    code = details.get("code")
+    return code if isinstance(code, str) else None
+
+
+def openai_retry_delay(error: RateLimitError, attempt: int) -> float:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {})
+    retry_after = headers.get("retry-after") if headers else None
+    if retry_after is not None:
+        try:
+            return min(max(float(retry_after), 0), MAX_OPENAI_RETRY_DELAY)
+        except (TypeError, ValueError):
+            pass
+    return min(0.5 * (2 ** attempt), MAX_OPENAI_RETRY_DELAY)
 
 
 def split_speech_chunks(
@@ -357,11 +383,21 @@ async def stream_turn(
 
     audio_task = asyncio.create_task(send_audio())
     try:
-        stream = await client.chat.completions.create(
-            model=MODEL,
-            stream=True,
-            messages=messages,
-        )
+        for attempt in range(OPENAI_RATE_LIMIT_RETRIES + 1):
+            try:
+                stream = await client.chat.completions.create(
+                    model=MODEL,
+                    stream=True,
+                    messages=messages,
+                )
+                break
+            except RateLimitError as error:
+                if (
+                    openai_rate_limit_code(error) == "insufficient_quota"
+                    or attempt == OPENAI_RATE_LIMIT_RETRIES
+                ):
+                    raise
+                await asyncio.sleep(openai_retry_delay(error, attempt))
 
         async for event in stream:
             if stop.is_set():
@@ -797,11 +833,23 @@ async def voice_socket(websocket: WebSocket) -> None:
                     await send_json(
                         {"type": "state", "state": "listening"}
                     )
-            except RateLimitError:
+            except RateLimitError as error:
+                quota_exhausted = (
+                    openai_rate_limit_code(error) == "insufficient_quota"
+                )
+                logger.warning(
+                    "OpenAI response rate-limited (%s)",
+                    type(error).__name__,
+                )
                 await send_error(
                     "openai_rate_limited",
-                    "OpenAI rate limit or usage quota reached. Check the "
-                    "account's limits and billing, then retry.",
+                    (
+                        "OpenAI API quota or billing limit is exhausted. "
+                        "Check usage and billing."
+                        if quota_exhausted
+                        else "OpenAI rate-limited this request. Wait and "
+                        "retry if temporary, or check account limits."
+                    ),
                 )
                 if selected_id == conversation_id and microphone is not None:
                     await send_json(

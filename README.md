@@ -105,6 +105,8 @@ LLM Gateway clients. The OpenAI client is closed when the WebSocket ends.
 Provider validation cannot guarantee later requests will be within quota. If
 OpenAI rate-limits a voice response, the UI reports that account limits or
 billing should be checked instead of showing only a generic failure.
+Transient rate limits are retried twice, honoring the provider's
+`Retry-After` header when available. Exhausted quota is not retried.
 
 To remove keys from the browser, select **Forget saved keys**. This closes the
 current connection; refresh the page to connect again. Do not use the remember
